@@ -1,0 +1,17 @@
+services:
+  forgejo:
+    build:
+      context: .
+      dockerfile: forgejo/Dockerfile
+    container_name: forgejo
+    environment:
+      - FORGEJO_ADMIN_USER=gitadmin
+      - FORGEJO_ADMIN_PASSWORD=admin123
+      - FORGEJO_ADMIN_EMAIL=admin@localhost
+    restart: unless-stopped
+    # host networking required: this machine uses redsocks for outbound traffic,
+    # and redsocks only intercepts traffic from the host netns (not Docker bridge).
+    # Without host mode, Forgejo cannot reach github.com through the proxy.
+    network_mode: host
+    volumes:
+      - /workspace/cache/git-proxy:/data
