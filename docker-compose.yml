@@ -15,3 +15,20 @@ services:
     network_mode: host
     volumes:
       - /workspace/cache/git-proxy:/data
+
+  git-proxy:
+    build:
+      context: .
+      dockerfile: proxy/Dockerfile
+    container_name: git-proxy
+    depends_on:
+      - forgejo
+    environment:
+      - FORGEJO_USER=gitadmin
+      - FORGEJO_PASSWORD=admin123
+      - PROXY_CONFIG=/config/hooks.yml
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /workspace/cache/git-proxy:/forgejo-data
+      - /workspace/cache/git-proxy/hooks-config:/config:ro

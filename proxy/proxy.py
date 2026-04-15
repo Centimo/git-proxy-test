@@ -26,6 +26,9 @@ import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
+from config import load_config
+import hooks as _hooks
+
 FORGEJO_URL = os.environ.get("FORGEJO_URL", "http://127.0.0.1:3000")
 FORGEJO_TOKEN = os.environ.get("FORGEJO_TOKEN", "")
 FORGEJO_USER = os.environ.get("FORGEJO_USER", "gitadmin")
@@ -48,6 +51,9 @@ log = logging.getLogger("git-proxy")
 
 if not FORGEJO_TOKEN:
   log.warning("FORGEJO_TOKEN is not set — API calls will fail with 401")
+
+PROXY_CONFIG_PATH = os.environ.get("PROXY_CONFIG", "/config/hooks.yml")
+_proxy_config = None
 
 
 def forgejo_api(method: str, path: str, body: dict | None = None, timeout: int = FORGEJO_API_TIMEOUT) -> tuple[int, dict]:
@@ -99,8 +105,17 @@ def _do_migrate(owner: str, repo: str):
   }, timeout=FORGEJO_MIGRATE_TIMEOUT)
   if status not in (201, 409):
     log.warning(f"migrate {owner}/{repo} failed: {status} {data}")
-  else:
-    log.info(f"migrate {owner}/{repo} done: {status}")
+    return
+  log.info(f"migrate {owner}/{repo} done: {status}")
+  # Register webhook after mirror is created, if a hook config exists for this repo
+  if _proxy_config is not None:
+    source_repo = f"{owner}/{repo}"
+    hook = next((h for h in _proxy_config.hooks if h.source_repo == source_repo), None)
+    if hook is not None:
+      try:
+        _hooks._register_webhook_for_hook(_proxy_config, hook)
+      except Exception as e:
+        log.error(f"failed to register webhook after migrate for {source_repo}: {e}")
 
 
 def create_mirror(owner: str, repo: str):
@@ -284,10 +299,43 @@ class ProxyHandler(BaseHTTPRequestHandler):
     self.handle_git_request()
 
   def do_POST(self):
+    if self.path.split("?")[0] == _hooks.WEBHOOK_PATH:
+      self._handle_webhook()
+      return
     self.handle_git_request()
+
+  def _handle_webhook(self):
+    if _proxy_config is None:
+      body = b"webhook functionality not configured"
+      self.send_response(503)
+      self.send_header("Content-Type", "text/plain")
+      self.send_header("Content-Length", str(len(body)))
+      self.end_headers()
+      self.wfile.write(body)
+      return
+
+    length = int(self.headers.get("Content-Length", 0))
+    body = self.rfile.read(length)
+
+    status, message = _hooks.handle_forgejo_webhook(body, self.headers, _proxy_config)
+
+    response = message.encode()
+    self.send_response(status)
+    self.send_header("Content-Type", "text/plain")
+    self.send_header("Content-Length", str(len(response)))
+    self.end_headers()
+    self.wfile.write(response)
 
 
 if __name__ == "__main__":
+  _proxy_config = load_config(PROXY_CONFIG_PATH)
+  if _proxy_config:
+    log.info(f"Loaded {len(_proxy_config.hooks)} hook(s) from {PROXY_CONFIG_PATH}")
+    _hooks.init(forgejo_api, FORGEJO_USER, LISTEN_PORT)
+    _hooks.register_all_webhooks_async(_proxy_config)
+  else:
+    log.info("No hook config loaded — webhook functionality disabled")
+
   log.info(f"git-proxy listening on port {LISTEN_PORT}")
   log.info(f"Forgejo: {FORGEJO_URL}, user: {FORGEJO_USER}")
   server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), ProxyHandler)
