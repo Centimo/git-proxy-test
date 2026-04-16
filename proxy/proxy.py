@@ -123,6 +123,32 @@ def create_mirror(owner: str, repo: str):
   t.start()
 
 
+_sync_triggered: set[str] = set()
+_sync_triggered_lock = threading.Lock()
+
+
+def _do_mirror_sync(owner: str, repo: str):
+  name = mirror_name(owner, repo)
+  status, data = forgejo_api("POST", f"/repos/{FORGEJO_USER}/{name}/mirror-sync")
+  if status == 200:
+    log.info(f"mirror-sync triggered: {owner}/{repo}")
+  else:
+    log.warning(f"mirror-sync failed: {owner}/{repo}: {status} {data}")
+  with _sync_triggered_lock:
+    _sync_triggered.discard(f"{owner}/{repo}")
+
+
+def trigger_mirror_sync(owner: str, repo: str):
+  key = f"{owner}/{repo}"
+  with _sync_triggered_lock:
+    if key in _sync_triggered:
+      log.info(f"mirror-sync already in progress: {owner}/{repo}")
+      return
+    _sync_triggered.add(key)
+  t = threading.Thread(target=_do_mirror_sync, args=(owner, repo), daemon=True)
+  t.start()
+
+
 def pkt_line(s: str) -> bytes:
   data = s.encode()
   length = len(data) + 4
@@ -284,6 +310,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
     if mirror is None:
       log.info(f"mirror not found, creating github.com/{owner}/{repo}")
       create_mirror(owner, repo)
+    elif mirror.get("empty", True):
+      log.info(f"mirror exists but empty, triggering sync: {owner}/{repo}")
+      trigger_mirror_sync(owner, repo)
 
     if mirror is None or mirror.get("empty", True):
       log.info(f"waiting for mirror to sync: {owner}/{repo}")
