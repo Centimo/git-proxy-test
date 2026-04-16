@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: forgejo/Dockerfile
+      network: host
     container_name: forgejo
     environment:
       - FORGEJO_ADMIN_USER=gitadmin
