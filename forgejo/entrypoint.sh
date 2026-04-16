@@ -76,6 +76,7 @@ FORGEJO_URL="http://127.0.0.1:3000" \
 FORGEJO_USER="${ADMIN_USER}" \
 FORGEJO_PASSWORD="${ADMIN_PASSWORD}" \
 PROXY_PORT="${PROXY_PORT:-8080}" \
+PROXY_CONFIG="${PROXY_CONFIG:-/config/hooks.yml}" \
   python3 /app/proxy.py &
 PROXY_PID=$!
 

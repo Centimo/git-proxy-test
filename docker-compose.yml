@@ -8,6 +8,7 @@ services:
       - FORGEJO_ADMIN_USER=gitadmin
       - FORGEJO_ADMIN_PASSWORD=admin123
       - FORGEJO_ADMIN_EMAIL=admin@localhost
+      - PROXY_CONFIG=/config/hooks.yml
     restart: unless-stopped
     # host networking required: this machine uses redsocks for outbound traffic,
     # and redsocks only intercepts traffic from the host netns (not Docker bridge).
@@ -15,20 +16,4 @@ services:
     network_mode: host
     volumes:
       - /workspace/cache/git-proxy:/data
-
-  git-proxy:
-    build:
-      context: .
-      dockerfile: proxy/Dockerfile
-    container_name: git-proxy
-    depends_on:
-      - forgejo
-    environment:
-      - FORGEJO_USER=gitadmin
-      - FORGEJO_PASSWORD=admin123
-      - PROXY_CONFIG=/config/hooks.yml
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - /workspace/cache/git-proxy:/forgejo-data
       - /workspace/cache/git-proxy/hooks-config:/config:ro
