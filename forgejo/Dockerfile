@@ -13,7 +13,7 @@ COPY --from=python-bin /usr/local/lib/libpython3.12.so.1.0 /usr/local/lib/libpyt
 
 COPY forgejo/app.ini /etc/forgejo/app.ini
 COPY forgejo/entrypoint.sh /entrypoint.sh
-COPY proxy/proxy.py /app/proxy.py
+COPY proxy/proxy.py proxy/config.py proxy/hooks.py /app/
 RUN chmod +x /entrypoint.sh
 
 VOLUME ["/data"]
