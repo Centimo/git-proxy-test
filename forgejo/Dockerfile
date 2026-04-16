@@ -1,4 +1,5 @@
 FROM python:3.12-alpine AS python-bin
+RUN pip install --no-cache-dir pyyaml
 
 FROM codeberg.org/forgejo/forgejo:9
 
