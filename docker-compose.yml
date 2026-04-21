@@ -6,9 +6,9 @@ services:
       network: host
     container_name: forgejo
     environment:
-      - FORGEJO_ADMIN_USER=gitadmin
-      - FORGEJO_ADMIN_PASSWORD=admin123
-      - FORGEJO_ADMIN_EMAIL=admin@localhost
+      - FORGEJO_ADMIN_USER=${FORGEJO_ADMIN_USER:?FORGEJO_ADMIN_USER must be set}
+      - FORGEJO_ADMIN_PASSWORD=${FORGEJO_ADMIN_PASSWORD:?FORGEJO_ADMIN_PASSWORD must be set}
+      - FORGEJO_ADMIN_EMAIL=${FORGEJO_ADMIN_EMAIL:-admin@localhost}
       - PROXY_CONFIG=/config/hooks.yml
     restart: unless-stopped
     # host networking required: this machine uses redsocks for outbound traffic,
