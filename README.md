@@ -154,6 +154,20 @@ docker compose up -d --build
 
 Данные (репозитории, sqlite, токен) — в `/workspace/cache/git-proxy` на хосте (см. volumes).
 
+## Тесты
+
+Юнит-тесты (`tests/`, pytest) покрывают чистую логику без сети и Forgejo: разбор конфига и
+SemVer-паттернов (`config.py`), парсинг refs / freshness-логику / валидацию имён (`proxy.py`),
+разбор имён зеркал / валидацию webhook-подписи / обработчик webhook (`hooks.py`). Все внешние
+вызовы (git, Forgejo API) замоканы.
+
+```bash
+python3 -m pytest tests/ -v
+```
+
+(Корневой `test_error_response.py` — интерактивный ручной скрипт, не pytest; он исключён
+через `testpaths` в `pytest.ini`.)
+
 ## Деплой на прод
 
 Registry нет — образ собирается локально и переносится на прод-хост через `docker save`.
