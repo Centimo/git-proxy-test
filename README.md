@@ -110,15 +110,17 @@ Docker-bridge. Без host-режима Forgejo не достучится до g
 | `FORGEJO_ADMIN_USER`      | Логин админа Forgejo (обязательно)             |
 | `FORGEJO_ADMIN_PASSWORD`  | Пароль админа (обязательно)                     |
 | `FORGEJO_ADMIN_EMAIL`     | Email админа (по умолчанию `admin@localhost`)  |
+| `PROXY_PORT`              | Порт, на котором слушает прокси (по умолчанию `8080`) |
+| `PROXY_CONFIG`            | Путь к hooks.yml внутри контейнера (по умолчанию `/config/hooks.yml`) |
 
 Прокси дополнительно читает `FORGEJO_URL`, `FORGEJO_TOKEN`, `FORGEJO_USER`,
 `FORGEJO_PASSWORD` — их проставляет `entrypoint.sh`.
 
-> **`PROXY_CONFIG` и `PROXY_PORT` из `.env` НЕ читаются.** `docker-compose.yml` в блоке
-> `environment:` прокидывает в контейнер только `FORGEJO_ADMIN_*` и `PROXY_CONFIG`, причём
-> `PROXY_CONFIG` там **захардкожен** (`/config/hooks.yml`), а `PROXY_PORT` не проброшен вовсе
-> (внутри контейнера он по умолчанию `8080`). Чтобы сменить порт или путь конфига через
-> `.env`, сначала добавьте соответствующую строку в `environment:` в `docker-compose.yml`.
+> **Смена порта.** Достаточно задать `PROXY_PORT` в `.env` (`docker-compose.yml` пробрасывает
+> его в контейнер) и пересоздать контейнер: `proxy.py` слушает на нём, а webhook-callback URL
+> внутри Forgejo (`hooks.py`) строится из того же значения — подхватится автоматически.
+> Единственное, что нужно поправить вручную, — клиентский `url.insteadOf` (он вне контейнера):
+> укажите там тот же порт.
 
 ### hooks.yml (опционально, для webhook→conan-common)
 
