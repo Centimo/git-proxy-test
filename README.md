@@ -27,24 +27,26 @@ git config --global url."http://<proxy-host>:8080/".insteadOf "https://github.co
 
 | Состояние зеркала в Forgejo         | Действие прокси                                              |
 |-------------------------------------|-------------------------------------------------------------|
-| Не существует                       | Создаёт mirror (Forgejo API `POST /repos/migrate`), возвращает git-`ERR` → клиент делает retry |
-| Существует, но пустое (`empty:true`) | Дёргает `mirror-sync`, ждёт заполнения; пока не готово — git-`ERR` (retry) |
+| Не существует                       | Создаёт зеркало (Forgejo API `POST /repos/migrate`), возвращает git-`ERR` → клиент повторяет запрос |
+| Существует, но пустое (`empty:true`) | Запускает `mirror-sync`, ждёт заполнения; пока не готово — git-`ERR` (клиент повторяет) |
 | Существует и заполнено              | Проксирует запрос в Forgejo; клиент получает данные          |
 
 ### Проверка свежести (freshness)
 
 Ключевая особенность — на каждый `GET /owner/repo/info/refs?service=git-upload-pack`
-(первый запрос любого `clone`/`fetch`) прокси сравнивает refs зеркала с upstream и при
-расхождении форсирует синхронизацию **синхронно**, до того как отдать данные клиенту.
+(первый запрос любого `clone`/`fetch`) прокси сравнивает ссылки (refs) зеркала с оригиналом
+на GitHub и при расхождении принудительно запускает синхронизацию **синхронно**, до того как
+отдать данные клиенту.
 Реализовано в классе `MirrorFreshness` (`proxy/proxy.py`):
 
 1. `git ls-remote` на GitHub (`refs/heads/*` + `refs/tags/*`), результат кешируется на
-   `LS_REMOTE_CACHE_TTL=30 с`; одновременные запросы одного репо коалесцируются (single-flight).
+   `LS_REMOTE_CACHE_TTL=30 с`; одновременные запросы одного репозитория объединяются в один
+   (single-flight — параллельные вызовы ждут результата первого, а не дублируют его).
 2. `git ls-remote` на зеркало в Forgejo.
 3. Если наборы `(refname → sha)` совпадают — отдаём как есть.
 4. Если различаются — `POST /mirror-sync` и ждём до `REF_SYNC_WAIT_TIMEOUT=120 с`, пока
    refs сойдутся. Дедупликация: параллельный второй sync того же репо не запускается.
-5. **Fail-open:** при любой ошибке обращения к upstream прокси всё равно проксирует запрос
+5. **Fail-open:** при любой ошибке обращения к оригиналу на GitHub прокси всё равно проксирует запрос
    (лучше отдать чуть устаревшее зеркало, чем упасть).
 
 > Эта проверка появилась в коммите `af2ef85` («proxy: ensure mirror freshness on info/refs
@@ -82,7 +84,7 @@ forgejo/
   app.ini              — конфиг Forgejo (sqlite, offline mode, SSH off)
   entrypoint.sh        — стартует Forgejo, создаёт admin + API-токен, затем запускает proxy.py
 proxy/
-  proxy.py             — HTTP-прокси, freshness-логика, git smart-HTTP проксирование
+  proxy.py             — HTTP-прокси, проверка свежести зеркал, git smart-HTTP проксирование
   config.py            — загрузка hooks.yml (dataclass HookConfig / ProxyConfig)
   hooks.py             — webhook-обработчик + git-workflow для conan-common
   Dockerfile           — отдельный образ только proxy (см. «Известные расхождения»)
@@ -159,7 +161,7 @@ docker compose up -d --build
 ## Тесты
 
 Юнит-тесты (`tests/`, pytest) покрывают чистую логику без сети и Forgejo: разбор конфига и
-SemVer-паттернов (`config.py`), парсинг refs / freshness-логику / валидацию имён (`proxy.py`),
+SemVer-паттернов (`config.py`), парсинг ссылок (refs) / проверку свежести / валидацию имён (`proxy.py`),
 разбор имён зеркал / валидацию webhook-подписи / обработчик webhook (`hooks.py`). Все внешние
 вызовы (git, Forgejo API) замоканы.
 
@@ -175,9 +177,9 @@ python3 -m pytest tests/ -v
 Registry нет — образ собирается локально и переносится на прод-хост через `docker save`.
 Полная процедура — в [DEPLOY.md](DEPLOY.md).
 
-## Форсировать обновление зеркала вручную
+## Принудительное обновление зеркала вручную
 
-На старом образе (без freshness-проверки) или для немедленной синхронизации:
+На старом образе (без проверки свежести) или для немедленной синхронизации:
 
 ```bash
 curl -s -X POST -u <admin>:<pass> \
@@ -197,7 +199,7 @@ curl -s -u <admin>:<pass> \
 Выбран **Forgejo** (fork Gitea): MIT+GPL, community-driven, бесплатен для коммерческого
 использования; функционально для нашей задачи идентичен Gitea.
 
-## Известные расхождения / гочи
+## Известные расхождения и подводные камни
 
 - **Два Dockerfile.** `docker-compose.yml` использует `forgejo/Dockerfile` (Forgejo+proxy в
   одном контейнере). Отдельный `proxy/Dockerfile` описывает контейнер только с proxy и

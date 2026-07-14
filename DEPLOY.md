@@ -69,9 +69,9 @@ curl -s -u gitadmin:<pass> "http://<PROXY_HOST>:3000/api/v1/repos/search?limit=1
 ssh <PROXY_HOST> 'docker logs --tail 100 forgejo'
 ```
 
-## Форсировать обновление зеркала
+## Принудительное обновление зеркала
 
-Нужно на **старом** образе (без per-pull freshness-проверки, коммит до `af2ef85`) либо для
+Нужно на **старом** образе (без проверки свежести на каждый запрос, коммит до `af2ef85`) либо для
 немедленной синхронизации без ожидания расписания Forgejo:
 
 ```bash
@@ -83,7 +83,7 @@ curl -s -X POST -u gitadmin:<pass> \
 curl -s -u gitadmin:<pass> \
   "http://<PROXY_HOST>:3000/api/v1/repos/gitadmin/<owner>__<repo>/branches/<branch>" | jq -r '.commit.id'
 
-# сравнить с upstream:
+# сравнить с оригиналом на GitHub:
 git ls-remote https://github.com/<owner>/<repo>.git refs/heads/<branch>
 
 # проверить наличие конкретного коммита в кэше зеркала:
