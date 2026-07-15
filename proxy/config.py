@@ -14,6 +14,8 @@ log = logging.getLogger("git-proxy")
 
 _ENV_VAR_RE = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}')
 
+DEFAULT_HOOK_TIMEOUT = 300  # seconds before a hook command is killed
+
 
 def _expand_env(value: str) -> str:
   return _ENV_VAR_RE.sub(lambda m: os.environ.get(m.group(1), m.group(0)), value)
@@ -21,12 +23,11 @@ def _expand_env(value: str) -> str:
 
 @dataclass
 class HookConfig:
-  source_repo: str       # "Centimo/simd"
-  tag_pattern: str       # "v{version}"
-  base_branch: str       # "main"
-  branch_prefix: str     # ""
-  branch_suffix: str     # ""
-  recipe_path: str       # "conan/conanfile.py"
+  source_repo: str        # "Centimo/simd" — owner/repo on GitHub
+  tag_pattern: str        # "v{version}" — {version} expands to a SemVer regex group
+  command: list[str]      # argv passed to subprocess (already normalized, no shell involved)
+  env: dict[str, str]     # extra environment variables exported to the command
+  timeout: int            # seconds before the command is killed
   _tag_re: re.Pattern = field(init=False, repr=False, compare=False)
 
   def __post_init__(self):
@@ -54,25 +55,63 @@ class HookConfig:
       return m.group('version')
     return None
 
-  def branch_name(self, version: str) -> str:
-    return f"{self.branch_prefix}{self.repo()}-{version}{self.branch_suffix}"
-
-  def package_ref(self, version: str) -> str:
-    return f"{self.repo()}/{version}"
-
-  def github_url(self) -> str:
+  def source_url(self) -> str:
     return f"https://github.com/{self.source_repo}.git"
 
 
 @dataclass
 class ProxyConfig:
-  gitlab_url: str
-  gitlab_token: str
-  gitlab_user: str
-  gitlab_email: str
-  conan_common_repo: str
   webhook_secret: str | None
   hooks: list[HookConfig]
+
+
+def _parse_command(raw, ctx: str) -> list[str]:
+  """
+  Normalize the `command` field into an argv list ready for subprocess.run.
+
+  - A string is run through the shell: ["/bin/sh", "-c", <string>].
+  - A list is used as argv verbatim (no shell).
+  Both forms have ${VAR} expanded from the environment.
+  """
+  if isinstance(raw, str):
+    cmd = _expand_env(raw)
+    if not cmd.strip():
+      raise ValueError(f"'command' is empty in {ctx}")
+    return ["/bin/sh", "-c", cmd]
+  if isinstance(raw, list):
+    if not raw:
+      raise ValueError(f"'command' list is empty in {ctx}")
+    argv = []
+    for part in raw:
+      if not isinstance(part, (str, int, float)) or isinstance(part, bool):
+        raise ValueError(f"'command' list items must be strings in {ctx}, got: {part!r}")
+      argv.append(_expand_env(str(part)))
+    if not argv[0].strip():
+      raise ValueError(f"'command' program (first list item) is empty in {ctx}")
+    return argv
+  raise ValueError(f"'command' must be a string or a list of strings in {ctx}")
+
+
+def _parse_env(raw, ctx: str) -> dict[str, str]:
+  if not raw:
+    return {}
+  if not isinstance(raw, dict):
+    raise ValueError(f"'env' must be a mapping in {ctx}")
+  out = {}
+  for k, v in raw.items():
+    key = str(k)
+    if not key or '=' in key or '\0' in key:
+      raise ValueError(f"invalid env var name {key!r} in {ctx}")
+    out[key] = _expand_env(str(v))
+  return out
+
+
+def _parse_timeout(raw, ctx: str) -> int:
+  if raw is None:
+    return DEFAULT_HOOK_TIMEOUT
+  if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+    raise ValueError(f"'timeout' must be a positive integer in {ctx}, got: {raw!r}")
+  return raw
 
 
 def load_config(path: str) -> ProxyConfig | None:
@@ -90,9 +129,14 @@ def load_config(path: str) -> ProxyConfig | None:
   if not raw:
     return None
 
+  if not isinstance(raw, dict):
+    raise ValueError("config root must be a mapping")
+
   hooks_raw = raw.get('hooks', [])
   if not hooks_raw:
     return None
+  if not isinstance(hooks_raw, list):
+    raise ValueError("'hooks' must be a list")
 
   def require(d: dict, key: str, context: str) -> str:
     val = d.get(key)
@@ -103,24 +147,22 @@ def load_config(path: str) -> ProxyConfig | None:
   hooks = []
   for i, h in enumerate(hooks_raw):
     ctx = f"hooks[{i}]"
+    if not isinstance(h, dict):
+      raise ValueError(f"{ctx} must be a mapping")
+    if 'command' not in h:
+      raise ValueError(f"Missing required field 'command' in {ctx}")
     hooks.append(HookConfig(
       source_repo=require(h, 'source_repo', ctx),
       tag_pattern=require(h, 'tag_pattern', ctx),
-      base_branch=require(h, 'base_branch', ctx),
-      branch_prefix=_expand_env(str(h.get('branch_prefix', ''))),
-      branch_suffix=_expand_env(str(h.get('branch_suffix', ''))),
-      recipe_path=require(h, 'recipe_path', ctx),
+      command=_parse_command(h.get('command'), ctx),
+      env=_parse_env(h.get('env'), ctx),
+      timeout=_parse_timeout(h.get('timeout'), ctx),
     ))
 
   secret = raw.get('webhook_secret')
   if secret is not None and not isinstance(secret, str):
     raise ValueError(f"webhook_secret must be a string, got: {type(secret).__name__}")
   return ProxyConfig(
-    gitlab_url=require(raw, 'gitlab_url', 'root'),
-    gitlab_token=require(raw, 'gitlab_token', 'root'),
-    gitlab_user=require(raw, 'gitlab_user', 'root'),
-    gitlab_email=require(raw, 'gitlab_email', 'root'),
-    conan_common_repo=require(raw, 'conan_common_repo', 'root'),
     webhook_secret=_expand_env(str(secret)) if secret else None,
     hooks=hooks,
   )

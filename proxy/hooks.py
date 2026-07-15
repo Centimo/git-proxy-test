@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Webhook handling and git workflow for git-proxy.
+Webhook handling for git-proxy.
 
 Receives Forgejo push events for mirrored repos, detects release tags,
-and creates branches in conan-common with an updated packages.yml.
+and runs a user-configured command per hook (see config.HookConfig).
+git-proxy itself is domain-agnostic: what to do on a release tag lives
+entirely in that external command.
 """
 
 import hashlib
@@ -11,19 +13,20 @@ import hmac
 import json
 import logging
 import os
+import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
-import urllib.parse
-
-import yaml
 
 from config import HookConfig, ProxyConfig
 
 log = logging.getLogger("git-proxy")
 
 WEBHOOK_PATH = "/webhook/forgejo"
+# git object name: 40 hex chars (sha1) or 64 hex chars (sha256)
+_SHA_RE = re.compile(r'^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$')
 # URL Forgejo will call back — works because container uses host networking
 _PROXY_WEBHOOK_URL = "http://127.0.0.1:{port}/webhook/forgejo"
 
@@ -196,6 +199,8 @@ def handle_forgejo_webhook(body: bytes, headers, cfg: ProxyConfig) -> tuple[int,
     event = json.loads(body)
   except json.JSONDecodeError as e:
     return 400, f"invalid JSON: {e}"
+  if not isinstance(event, dict):
+    return 400, "payload is not a JSON object"
 
   ref = event.get('ref', '')
   if not ref.startswith('refs/tags/'):
@@ -203,7 +208,8 @@ def handle_forgejo_webhook(body: bytes, headers, cfg: ProxyConfig) -> tuple[int,
 
   tag = ref[len('refs/tags/'):]
 
-  full_name = event.get('repository', {}).get('full_name', '')
+  repo_obj = event.get('repository')
+  full_name = repo_obj.get('full_name', '') if isinstance(repo_obj, dict) else ''
   parsed = _parse_mirror_full_name(full_name)
   if parsed is None:
     log.warning(f"cannot parse mirror full_name: {full_name!r}")
@@ -221,10 +227,12 @@ def handle_forgejo_webhook(body: bytes, headers, cfg: ProxyConfig) -> tuple[int,
   if version is None:
     return 200, f"tag {tag!r} does not match pattern {hook.tag_pattern!r}, ignored"
 
-  # Resolve commit SHA
+  # Resolve commit SHA. Validate it is a real git object name before it flows into
+  # the Forgejo API path and the hook command's environment — an unauthenticated
+  # webhook (no secret) would otherwise fully control this value.
   tag_sha = event.get('after', '')
-  if not tag_sha or set(tag_sha) == {'0'}:
-    return 400, "missing or zero 'after' SHA in payload"
+  if not isinstance(tag_sha, str) or not _SHA_RE.match(tag_sha) or set(tag_sha) == {'0'}:
+    return 400, "missing or invalid 'after' SHA in payload"
 
   mirror = _mirror_name(owner, repo)
   commit_sha = _resolve_commit_sha(mirror, tag_sha)
@@ -232,8 +240,8 @@ def handle_forgejo_webhook(body: bytes, headers, cfg: ProxyConfig) -> tuple[int,
   log.info(f"tag {tag} on {source_repo} matched, version={version}, commit={commit_sha}")
 
   t = threading.Thread(
-    target=_git_workflow_safe,
-    args=(cfg, hook, version, commit_sha),
+    target=_run_command_safe,
+    args=(hook, tag, version, commit_sha),
     daemon=True,
   )
   t.start()
@@ -242,129 +250,77 @@ def handle_forgejo_webhook(body: bytes, headers, cfg: ProxyConfig) -> tuple[int,
 
 
 # ---------------------------------------------------------------------------
-# Git workflow
+# Hook command execution
 # ---------------------------------------------------------------------------
 
-class GitError(Exception):
-  pass
-
-
-def run_git(*args, cwd: str, env: dict | None = None, timeout: int = 120) -> str:
-  result = subprocess.run(
-    ["git", *args],
-    cwd=cwd,
-    env=env,
-    capture_output=True,
-    text=True,
-    timeout=timeout,
-  )
-  if result.returncode != 0:
-    raise GitError(result.stderr.strip())
-  return result.stdout.strip()
-
-
-def _git_workflow_safe(cfg: ProxyConfig, hook: HookConfig, version: str, commit_sha: str):
+def _run_command_safe(hook: HookConfig, tag: str, version: str, commit_sha: str):
   try:
-    _git_workflow(cfg, hook, version, commit_sha)
+    _run_command(hook, tag, version, commit_sha)
   except Exception as e:
-    log.error(f"git workflow failed for {hook.source_repo} {version}: {e}")
+    log.error(f"hook command errored for {hook.source_repo} {version}: {e}")
 
 
-def _make_git_env(cfg: ProxyConfig, tmpdir: str) -> tuple[str, dict]:
+def _run_command(hook: HookConfig, tag: str, version: str, commit_sha: str):
   """
-  Build a git clone URL and env with credentials stored in a netrc file
-  inside tmpdir to avoid leaking the token in process args or git config.
-  Returns (clone_url_without_creds, env_dict).
+  Run the hook's configured command for a matched release tag.
+
+  The command inherits the proxy's environment plus the hook's own `env`
+  entries, plus the GIT_PROXY_* variables describing the release. It runs
+  in a fresh temporary working directory (also exported as GIT_PROXY_WORKDIR),
+  which is removed afterwards.
   """
-  parsed = urllib.parse.urlparse(cfg.gitlab_url)
-  host = parsed.netloc  # e.g. "gitlab.example.com"
-  scheme = parsed.scheme
-
-  netrc_path = os.path.join(tmpdir, ".netrc")
-  fd = os.open(netrc_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-  with os.fdopen(fd, 'w') as f:
-    f.write(f"machine {host}\n")
-    f.write(f"login {cfg.gitlab_user}\n")
-    f.write(f"password {cfg.gitlab_token}\n")
-
-  clone_url = f"{scheme}://{host}/{cfg.conan_common_repo}.git"
+  mirror = _mirror_name(hook.owner(), hook.repo())
 
   env = os.environ.copy()
-  env["GIT_CONFIG_COUNT"] = "1"
-  env["GIT_CONFIG_KEY_0"] = "credential.helper"
-  env["GIT_CONFIG_VALUE_0"] = ""
-  env["HOME"] = tmpdir  # git reads ~/.netrc from HOME
-
-  return clone_url, env
-
-
-def _git_workflow(cfg: ProxyConfig, hook: HookConfig, version: str, commit_sha: str):
-  branch = hook.branch_name(version)
-  package_ref = hook.package_ref(version)
+  env.update(hook.env)
+  env.update({
+    "GIT_PROXY_SOURCE_REPO": hook.source_repo,
+    "GIT_PROXY_SOURCE_URL": hook.source_url(),
+    "GIT_PROXY_MIRROR": f"{_forgejo_user}/{mirror}",
+    "GIT_PROXY_TAG": tag,
+    "GIT_PROXY_VERSION": version,
+    "GIT_PROXY_COMMIT_SHA": commit_sha,
+  })
 
   tmpdir = tempfile.mkdtemp(prefix="git-proxy-hook-")
+  env["GIT_PROXY_WORKDIR"] = tmpdir
   try:
-    clone_url, git_env = _make_git_env(cfg, tmpdir)
-    workdir = os.path.join(tmpdir, "conan-common")
-
-    log.info(f"cloning {cfg.conan_common_repo} branch {hook.base_branch}")
-    run_git(
-      "clone", "--depth=1", "--branch", hook.base_branch,
-      clone_url, workdir,
-      cwd=tmpdir, env=git_env, timeout=120,
+    # start_new_session=True puts the command in its own process group so that on
+    # timeout we can kill the whole tree — for a string command the direct child is
+    # /bin/sh, and a plain proc.kill() would orphan anything it backgrounded.
+    proc = subprocess.Popen(
+      hook.command,
+      cwd=tmpdir,
+      env=env,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.PIPE,
+      text=True,
+      start_new_session=True,
     )
-
-    run_git("config", "user.email", cfg.gitlab_email, cwd=workdir, env=git_env)
-    run_git("config", "user.name", cfg.gitlab_user, cwd=workdir, env=git_env)
-
-    # Check if branch already exists remotely
-    result = subprocess.run(
-      ["git", "ls-remote", "--heads", "origin", branch],
-      cwd=workdir, env=git_env, capture_output=True, text=True, timeout=60,
-    )
-    if result.returncode != 0:
-      raise GitError(f"ls-remote failed: {result.stderr.strip()}")
-    if result.stdout.strip():
-      log.info(f"branch {branch} already exists in {cfg.conan_common_repo}, skipping")
+    try:
+      _, stderr = proc.communicate(timeout=hook.timeout)
+    except subprocess.TimeoutExpired:
+      try:
+        os.killpg(proc.pid, signal.SIGKILL)
+      except ProcessLookupError:
+        pass
+      proc.communicate()
+      log.error(
+        "hook command timed out",
+        extra={"repo": hook.source_repo, "version": version, "timeout": hook.timeout},
+      )
       return
 
-    run_git("checkout", "-b", branch, cwd=workdir, env=git_env)
-
-    # Update packages.yml
-    packages_yml_path = os.path.join(workdir, "packages.yml")
-    if os.path.exists(packages_yml_path):
-      with open(packages_yml_path) as f:
-        data = yaml.safe_load(f) or {}
+    if proc.returncode != 0:
+      log.error(
+        "hook command failed",
+        extra={
+          "repo": hook.source_repo, "version": version,
+          "returncode": proc.returncode,
+          "stderr": (stderr or "").strip()[:500],
+        },
+      )
     else:
-      data = {}
-
-    packages = data.get('packages', [])
-    if not isinstance(packages, list):
-      packages = []
-
-    # Check if package_ref already present
-    for entry in packages:
-      if isinstance(entry, dict) and entry.get('package_ref') == package_ref:
-        log.info(f"{package_ref} already in packages.yml, skipping")
-        return
-
-    new_entry = {
-      'package_ref': package_ref,
-      'repo': hook.github_url(),
-      'ref': commit_sha,
-      'recipe_path': hook.recipe_path,
-    }
-    packages.append(new_entry)
-    data['packages'] = packages
-
-    with open(packages_yml_path, 'w') as f:
-      yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-
-    run_git("add", "packages.yml", cwd=workdir, env=git_env)
-    run_git("commit", "-m", f"Add {package_ref}", cwd=workdir, env=git_env)
-    run_git("push", "origin", branch, cwd=workdir, env=git_env, timeout=120)
-
-    log.info(f"pushed branch {branch} to {cfg.conan_common_repo} with {package_ref}")
-
+      log.info("hook command succeeded", extra={"repo": hook.source_repo, "version": version})
   finally:
     shutil.rmtree(tmpdir, ignore_errors=True)

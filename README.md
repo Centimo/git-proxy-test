@@ -2,8 +2,8 @@
 
 HTTP-прокси перед Forgejo, который **по требованию** зеркалирует GitHub-репозитории и
 на каждый `git clone`/`fetch` гарантирует их свежесть. Плюс webhook-механизм, который на
-пуш релизного тега в зеркало автоматически заводит ветку с обновлённым `packages.yml`
-в conan-common.
+пуш релизного тега в зеркало запускает произвольную внешнюю команду — сам прокси не знает
+ни про conan, ни про какую-либо конкретную цель.
 
 ## Зачем
 
@@ -81,19 +81,37 @@ git config --global url."http://<proxy-host>:8080/".insteadOf "https://github.co
 > Ограничение: если `owner` или `repo` сами содержат `__`, обратный разбор имени
 > (`hooks.py:_parse_mirror_full_name`) неоднозначен. Известное ограничение схемы-делимитера.
 
-## Webhook → conan-common
+## Webhook → внешняя команда
 
 Отдельная функция (`proxy/hooks.py`), включается только если задан `PROXY_CONFIG` с непустым
 списком `hooks`. Форгейо шлёт push-события зеркала на `POST /webhook/forgejo` прокси:
 
 1. Событие — пуш тега (`refs/tags/*`), тег матчит `tag_pattern` хука (SemVer).
-2. Прокси клонирует conan-common (GitLab), заводит ветку `{prefix}{repo}-{version}{suffix}`.
-3. Добавляет в `packages.yml` запись `{package_ref, repo, ref: <commit-sha>, recipe_path}`.
-4. Коммитит и пушит ветку.
+2. Прокси разыменовывает аннотированный тег до commit-SHA и запускает `command` этого хука
+   во временном рабочем каталоге, передавая параметры релиза через переменные окружения.
+3. Прокси не делает больше ничего: вся логика (клонировать что-то, править файл, пушить ветку
+   и т.п.) живёт целиком в этой внешней команде.
 
 Webhook'и регистрируются в зеркалах автоматически при старте и после создания зеркала.
 Подпись валидируется по `webhook_secret` (HMAC-SHA256, заголовок `X-Gitea-Signature`,
 fallback `X-Forgejo-Signature`), если он задан.
+
+### Переменные окружения команды
+
+Команда наследует окружение прокси, плюс `env` этого хука, плюс:
+
+| Переменная               | Значение                                                    |
+|--------------------------|-------------------------------------------------------------|
+| `GIT_PROXY_SOURCE_REPO`  | `owner/repo` на GitHub (например `Centimo/simd`)            |
+| `GIT_PROXY_SOURCE_URL`   | `https://github.com/owner/repo.git`                         |
+| `GIT_PROXY_MIRROR`       | Полное имя зеркала в Forgejo (`gitadmin/owner__repo`)       |
+| `GIT_PROXY_TAG`          | Исходный тег (`v1.2.3`)                                      |
+| `GIT_PROXY_VERSION`      | Версия из тега по `tag_pattern` (`1.2.3`)                   |
+| `GIT_PROXY_COMMIT_SHA`   | Commit-SHA, на который указывает тег (разыменованный)       |
+| `GIT_PROXY_WORKDIR`      | Временный рабочий каталог команды (`cwd`; удаляется после)  |
+
+Команда выполняется в фоне (ошибка/таймаут только логируется, на HTTP-ответ webhook не влияет —
+Forgejo сразу получает `202`). Каталог `GIT_PROXY_WORKDIR` удаляется по завершении.
 
 ## Компоненты и структура
 
@@ -106,7 +124,7 @@ forgejo/
 proxy/
   proxy.py             — HTTP-прокси, проверка свежести зеркал, git smart-HTTP проксирование
   config.py            — загрузка hooks.yml (dataclass HookConfig / ProxyConfig)
-  hooks.py             — webhook-обработчик + git-workflow для conan-common
+  hooks.py             — webhook-обработчик + запуск внешней команды хука
   Dockerfile           — отдельный образ только proxy (см. «Известные расхождения»)
   entrypoint.sh        — ждёт токен от Forgejo, запускает proxy.py
 .env                   — секреты (в .gitignore; см. переменные ниже)
@@ -146,26 +164,31 @@ Docker-bridge. Без host-режима Forgejo не достучится до g
 > Единственное, что нужно поправить вручную, — клиентский `url.insteadOf` (он вне контейнера):
 > укажите там тот же порт.
 
-### hooks.yml (опционально, для webhook→conan-common)
+### hooks.yml (опционально, для webhook-хуков)
 
-Монтируется в `/config` (см. `docker-compose.yml`), в git **не хранится** (содержит токены).
-Значения `${VAR}` раскрываются из окружения. Структура (см. `proxy/config.py`):
+Монтируется в `/config` (см. `docker-compose.yml`), в git **не хранится** (может содержать
+секреты). Значения `${VAR}` раскрываются из окружения. Структура (см. `proxy/config.py`):
 
 ```yaml
-gitlab_url: https://gitlab.example.com
-gitlab_token: ${GITLAB_TOKEN}
-gitlab_user: some-bot
-gitlab_email: bot@example.com
-conan_common_repo: group/conan-common
-webhook_secret: ${WEBHOOK_SECRET}   # опционально
+webhook_secret: ${WEBHOOK_SECRET}    # опционально; включает проверку HMAC-подписи
 hooks:
-  - source_repo: Centimo/simd        # owner/repo на GitHub
-    tag_pattern: "v{version}"         # {version} → SemVer-regex
-    base_branch: main                 # база в conan-common
-    branch_prefix: ""                 # префикс имени ветки (опц.)
-    branch_suffix: ""                 # суффикс имени ветки (опц.)
-    recipe_path: conan/conanfile.py   # путь к рецепту в записи packages.yml
+  - source_repo: Centimo/simd        # owner/repo на GitHub (обязательно)
+    tag_pattern: "v{version}"         # {version} → SemVer-regex (обязательно)
+    command: /config/hooks/on-release.sh   # что запустить на совпавший тег (обязательно)
+    timeout: 300                      # секунд до убийства команды (опц., по умолчанию 300)
+    env:                              # доп. переменные окружения команды (опц.)
+      TARGET_REPO: group/conan-common
+      GITLAB_TOKEN: ${GITLAB_TOKEN}
 ```
+
+`command` может быть:
+
+- строкой — выполняется через `/bin/sh -c` (доступны `&&`, пайпы, `cd` и т.п.);
+- списком argv — выполняется напрямую, без шелла: `command: ["python3", "on-release.py"]`.
+
+Сама команда (скрипт) в git-proxy не входит — она специфична для вашей задачи и живёт рядом
+с `hooks.yml` (например, смонтированной в `/config`). Внутри доступны переменные `GIT_PROXY_*`
+(см. «Переменные окружения команды») и всё, что задано в `env`.
 
 ## Запуск (локально)
 
