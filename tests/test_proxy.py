@@ -19,48 +19,6 @@ class TestMirrorName:
 
 
 # ---------------------------------------------------------------------------
-# _parse_ls_remote
-# ---------------------------------------------------------------------------
-
-class TestParseLsRemote:
-  def test_parses_heads_and_tags(self):
-    output = (
-      "aaaa1111\trefs/heads/main\n"
-      "bbbb2222\trefs/tags/v1.0.0\n"
-    )
-    refs = proxy._parse_ls_remote(output)
-    assert refs == {
-      "refs/heads/main": "aaaa1111",
-      "refs/tags/v1.0.0": "bbbb2222",
-    }
-
-  def test_ignores_non_heads_non_tags_refs(self):
-    output = (
-      "aaaa1111\trefs/heads/main\n"
-      "cccc3333\trefs/pull/1/head\n"
-      "dddd4444\tHEAD\n"
-    )
-    refs = proxy._parse_ls_remote(output)
-    assert refs == {"refs/heads/main": "aaaa1111"}
-
-  def test_ignores_peeled_tags(self):
-    output = (
-      "bbbb2222\trefs/tags/v1.0.0\n"
-      "eeee5555\trefs/tags/v1.0.0^{}\n"
-    )
-    refs = proxy._parse_ls_remote(output)
-    assert refs == {"refs/tags/v1.0.0": "bbbb2222"}
-
-  def test_skips_lines_without_tab(self):
-    output = "not-a-valid-line\naaaa1111\trefs/heads/main\n"
-    refs = proxy._parse_ls_remote(output)
-    assert refs == {"refs/heads/main": "aaaa1111"}
-
-  def test_empty_input_returns_empty_dict(self):
-    assert proxy._parse_ls_remote("") == {}
-
-
-# ---------------------------------------------------------------------------
 # pkt_line
 # ---------------------------------------------------------------------------
 
@@ -124,11 +82,13 @@ class TestNameRe:
 
 
 # ---------------------------------------------------------------------------
-# MirrorFreshness.upstream_refs — caching / TTL
+# MirrorFreshness.ensure_synced — sync-on-demand: freshness cache, wait/async modes,
+# single-flight dedup, fail-open
 # ---------------------------------------------------------------------------
 
-class TestUpstreamRefsCaching:
+class TestEnsureSynced:
   def _freshness(self, **kwargs):
+    kwargs.setdefault("sync_mode", "wait")
     return proxy.MirrorFreshness(
       forgejo_url="http://forgejo.local",
       forgejo_user="gitadmin",
@@ -136,257 +96,480 @@ class TestUpstreamRefsCaching:
       **kwargs,
     )
 
-  @staticmethod
-  def _fake_process(stdout="", returncode=0, stderr=""):
-    proc = MagicMock()
-    proc.stdout = stdout
-    proc.returncode = returncode
-    proc.stderr = stderr
-    return proc
+  def test_cache_hit_second_call_within_ttl_skips_sync(self):
+    mf = self._freshness(freshness_ttl=30)
+    with patch("proxy.forgejo_api", return_value=(200, {})) as mock_api, \
+         patch("proxy.time.sleep"):
+      # First call: prev mirror_updated fetch (GET) + sync (POST) + poll (GET, changed value).
+      mock_api.side_effect = [
+        (200, {"mirror_updated": "t0"}),   # prev
+        (200, {}),                          # mirror-sync POST
+        (200, {"mirror_updated": "t1"}),   # poll: changed → converged
+      ]
+      first = mf.ensure_synced("owner", "repo")
+      mock_api.side_effect = None
+      mock_api.reset_mock()
+      second = mf.ensure_synced("owner", "repo")
+    assert first is True
+    assert second is True
+    mock_api.assert_not_called()
 
-  def test_second_call_within_ttl_uses_cache(self):
-    # _fetch_upstream_refs (not mocked away here) is what actually populates the
-    # cache, so we mock subprocess.run instead and let the real caching path run.
-    mf = self._freshness(cache_ttl=30)
-    fake_output = "sha1\trefs/heads/main\n"
-    with patch("proxy.subprocess.run", return_value=self._fake_process(stdout=fake_output)) as mock_run:
-      first = mf.upstream_refs("owner", "repo")
-      second = mf.upstream_refs("owner", "repo")
-    assert first == {"refs/heads/main": "sha1"}
-    assert second == {"refs/heads/main": "sha1"}
-    mock_run.assert_called_once()
+  def test_cache_expired_triggers_sync_again(self):
+    mf = self._freshness(freshness_ttl=0)
+    with patch("proxy.forgejo_api") as mock_api, \
+         patch("proxy.time.sleep"):
+      mock_api.side_effect = [
+        (200, {"mirror_updated": "t0"}),
+        (200, {}),
+        (200, {"mirror_updated": "t1"}),
+      ]
+      first = mf.ensure_synced("owner", "repo")
+      mock_api.side_effect = [
+        (200, {"mirror_updated": "t1"}),
+        (200, {}),
+        (200, {"mirror_updated": "t2"}),
+      ]
+      second = mf.ensure_synced("owner", "repo")
+    assert first is True
+    assert second is True
 
-  def test_ttl_expiry_triggers_new_fetch(self):
-    mf = self._freshness(cache_ttl=0)
-    fake_output = "sha1\trefs/heads/main\n"
-    with patch("proxy.subprocess.run", return_value=self._fake_process(stdout=fake_output)) as mock_run:
-      mf.upstream_refs("owner", "repo")
-      mf.upstream_refs("owner", "repo")
-    assert mock_run.call_count == 2
+  def test_wait_mode_polls_until_mirror_updated_changes_then_true(self):
+    mf = self._freshness(sync_mode="wait", freshness_ttl=30, sync_wait_timeout=30)
+    with patch.object(mf, "_get_mirror_updated", side_effect=[(True, "t0"), (True, "t0"), (True, "t1")]) as mock_get, \
+         patch("proxy.forgejo_api", return_value=(200, {})) as mock_api, \
+         patch("proxy.time.sleep") as mock_sleep:
+      result = mf.ensure_synced("owner", "repo")
+    assert result is True
+    mock_api.assert_called_once()
+    assert mock_api.call_args[0][0] == "POST"
+    assert "mirror-sync" in mock_api.call_args[0][1]
+    assert mock_get.call_count == 3  # prev + 2 polls
+    mock_sleep.assert_called()
 
-  def test_fetch_error_returns_none(self):
-    mf = self._freshness()
-    with patch.object(mf, "_fetch_upstream_refs", return_value=None):
-      assert mf.upstream_refs("owner", "repo") is None
+  def test_poll_bounds_http_timeout_by_remaining_deadline(self):
+    """Each poll's _get_mirror_updated must be called with a timeout bounded by the time left
+    until the deadline (min of FORGEJO_API_TIMEOUT and remaining), so a single slow HTTP call
+    can't overrun sync_wait_timeout by up to a full FORGEJO_API_TIMEOUT."""
+    mf = self._freshness(sync_mode="wait", freshness_ttl=30, sync_wait_timeout=5)
+    poll_timeouts = []
 
-  def test_different_repos_cached_independently(self):
-    mf = self._freshness(cache_ttl=30)
-    outputs = ["sha_a\trefs/heads/main\n", "sha_b\trefs/heads/main\n"]
-    with patch("proxy.subprocess.run", side_effect=[self._fake_process(stdout=o) for o in outputs]) as mock_run:
-      r1 = mf.upstream_refs("owner1", "repo1")
-      r2 = mf.upstream_refs("owner2", "repo2")
-    assert r1 == {"refs/heads/main": "sha_a"}
-    assert r2 == {"refs/heads/main": "sha_b"}
-    assert mock_run.call_count == 2
+    def fake_get(owner, repo, timeout=proxy.FORGEJO_API_TIMEOUT):
+      poll_timeouts.append(timeout)
+      # prev-snapshot (1st call) then converge on the first poll.
+      return (True, "t0") if len(poll_timeouts) == 1 else (True, "t1")
 
-  def test_single_flight_concurrent_real_threads_coalesce_into_one_fetch(self):
-    """Two real threads calling upstream_refs for the same repo at the same time
-    must coalesce into exactly one subprocess.run call (leader/follower via
-    threading.Event, proxy.py:195-227). The fake subprocess.run blocks on a
-    barrier until both threads have entered upstream_refs, guaranteeing an
-    actual race rather than an accidental serialization."""
-    mf = self._freshness(cache_ttl=30)
+    with patch.object(mf, "_get_mirror_updated", side_effect=fake_get), \
+         patch("proxy.forgejo_api", return_value=(200, {})), \
+         patch("proxy.time.sleep"):
+      result = mf.ensure_synced("owner", "repo")
+    assert result is True
+    # First call is the pre-snapshot (default timeout); the poll call (2nd) must carry a
+    # bounded timeout: positive and no larger than both the remaining budget and the cap.
+    poll_timeout = poll_timeouts[1]
+    assert 0 < poll_timeout <= proxy.FORGEJO_API_TIMEOUT
+    assert poll_timeout <= 5  # cannot exceed sync_wait_timeout
+
+  def test_wait_mode_times_out_returns_false_and_logs_error(self):
+    mf = self._freshness(sync_mode="wait", freshness_ttl=30, sync_wait_timeout=0)
+    with patch.object(mf, "_get_mirror_updated", return_value=(True, "t0")), \
+         patch("proxy.forgejo_api", return_value=(200, {})), \
+         patch("proxy.time.sleep"), \
+         patch.object(proxy.log, "error") as mock_log_error:
+      result = mf.ensure_synced("owner", "repo")
+    assert result is False
+    mock_log_error.assert_called()
+    assert mf._is_fresh("owner/repo") is False
+
+  def test_async_mode_returns_true_immediately_without_marking_fresh_synchronously(self):
+    """async mode must return control to the caller fast, WITHOUT waiting for the background
+    sync to complete. Critically, the mirror must NOT be marked fresh synchronously — the
+    background thread is blocked (via a controlled Event) until after we've asserted this, so
+    if ensure_synced's return had (incorrectly) already marked fresh, this test would catch it."""
+    mf = self._freshness(sync_mode="async", freshness_ttl=30, sync_wait_timeout=5)
+    bg_may_proceed = threading.Event()
+    get_calls = {"n": 0}
+
+    def fake_api(method, path, *args, **kwargs):
+      if method == "GET":
+        get_calls["n"] += 1
+        # First GET (pre-snapshot, before POST) returns "t0"; every GET after that (in the
+        # poll loop, which only runs once the background thread is released) returns "t1" so
+        # the background thread converges promptly instead of spinning to its own timeout.
+        return 200, {"mirror_updated": "t0" if get_calls["n"] == 1 else "t1"}
+      # POST: block the background thread here until the test says so.
+      bg_may_proceed.wait(timeout=5)
+      return 200, {}
+
+    with patch("proxy.forgejo_api", side_effect=fake_api), \
+         patch("proxy.time.sleep"):
+      result = mf.ensure_synced("owner", "repo")
+      # ensure_synced returned already; the background thread is still blocked on the POST.
+      assert result is True
+      assert mf._is_fresh("owner/repo") is False, \
+        "must not be marked fresh synchronously — only the background thread may do that, on real completion"
+      bg_may_proceed.set()
+      # Give the background thread a moment to finish (poll _ensure_inflight instead of sleep;
+      # this loop's own time.sleep is the REAL one — only proxy.time.sleep is mocked above).
+      deadline = time.monotonic() + 5
+      while mf._ensure_inflight and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert mf._ensure_inflight == {}
+    assert mf._is_fresh("owner/repo") is True, "background thread must mark fresh once it genuinely converges"
+
+  def test_async_mode_background_sync_failure_does_not_mark_fresh(self):
+    """If the background sync fails (mirror-sync POST returns non-200), the mirror must NOT
+    be marked fresh once the background thread finishes — a later request within freshness_ttl
+    must still see it as not fresh and be able to retry the sync."""
+    mf = self._freshness(sync_mode="async", freshness_ttl=30, sync_wait_timeout=5)
+
+    def fake_api(method, path, *args, **kwargs):
+      if method == "GET":
+        return 200, {"mirror_updated": "t0"}
+      return 500, {"message": "boom"}  # mirror-sync POST fails
+
+    with patch("proxy.forgejo_api", side_effect=fake_api), \
+         patch("proxy.time.sleep"):
+      result = mf.ensure_synced("owner", "repo")
+      assert result is True  # async still returns True fast regardless of eventual outcome
+      deadline = time.monotonic() + 5
+      while mf._ensure_inflight and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert mf._ensure_inflight == {}
+    assert mf._is_fresh("owner/repo") is False, "a failed background sync must not mark the mirror fresh"
+
+  def test_async_mode_background_sync_timeout_does_not_mark_fresh(self):
+    """If the background sync's poll loop times out (mirror_updated never converges), the
+    mirror must NOT be marked fresh."""
+    mf = self._freshness(sync_mode="async", freshness_ttl=30, sync_wait_timeout=0.001)
+
+    def fake_api(method, path, *args, **kwargs):
+      if method == "GET":
+        return 200, {"mirror_updated": "t0"}  # never changes -> never converges
+      return 200, {}
+
+    with patch("proxy.forgejo_api", side_effect=fake_api), \
+         patch("proxy.time.sleep"), \
+         patch.object(proxy.log, "error") as mock_log_error:
+      result = mf.ensure_synced("owner", "repo")
+      assert result is True
+      deadline = time.monotonic() + 5
+      while mf._ensure_inflight and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert mf._ensure_inflight == {}
+    assert mf._is_fresh("owner/repo") is False
+    mock_log_error.assert_called()
+
+  def test_async_mode_background_thread_exception_does_not_crash_and_clears_inflight(self):
+    """An unexpected exception inside the background thread (e.g. _mark_fresh raising) must
+    not propagate (it's a daemon thread — an uncaught exception there would just be logged by
+    Python's default excepthook and silently leave bookkeeping stuck) and must still release
+    _ensure_inflight[key] so a later call isn't stuck forever."""
+    mf = self._freshness(sync_mode="async", freshness_ttl=30, sync_wait_timeout=5)
+    get_calls = {"n": 0}
+
+    def fake_api(method, path, *args, **kwargs):
+      if method == "GET":
+        get_calls["n"] += 1
+        # First GET = pre-snapshot ("t0"); subsequent GETs = poll, already converged ("t1").
+        return 200, {"mirror_updated": "t0" if get_calls["n"] == 1 else "t1"}
+      return 200, {}
+
+    with patch("proxy.forgejo_api", side_effect=fake_api), \
+         patch.object(mf, "_mark_fresh", side_effect=RuntimeError("boom")), \
+         patch("proxy.time.sleep"), \
+         patch.object(proxy.log, "error") as mock_log_error:
+      result = mf.ensure_synced("owner", "repo")
+      assert result is True
+      deadline = time.monotonic() + 5
+      while mf._ensure_inflight and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert mf._ensure_inflight == {}, "background thread must clear inflight even if it raises internally"
+    mock_log_error.assert_called()
+
+  def test_async_mode_thread_start_failure_releases_inflight_and_fails_open(self):
+    """If the background sync thread cannot even be started (e.g. RuntimeError under thread/fd
+    exhaustion), the leader must release the in-flight slot itself — otherwise the background
+    body's finally never runs, the key stays stuck forever, and this repo silently stops being
+    synced (every later async caller sees is_leader=False and returns True without syncing)."""
+    mf = self._freshness(sync_mode="async", freshness_ttl=30)
+    with patch("proxy.threading.Thread") as mock_thread, \
+         patch.object(proxy.log, "error") as mock_log_error:
+      mock_thread.return_value.start.side_effect = RuntimeError("can't start new thread")
+      result = mf.ensure_synced("owner", "repo")
+
+    assert result is False, "thread-start failure must fail open (False), not raise"
+    assert mf._ensure_inflight == {}, "in-flight slot must be released so a later call can retry"
+    assert mf._is_fresh("owner/repo") is False, "must not be marked fresh — no sync happened"
+    mock_log_error.assert_called()
+
+    # A subsequent call must be able to become leader again (key was released).
+    with patch("proxy.threading.Thread") as mock_thread2:
+      mf.ensure_synced("owner", "repo")
+      mock_thread2.return_value.start.assert_called_once()
+
+  def test_fail_open_api_exception_returns_false_no_raise(self):
+    mf = self._freshness(sync_mode="wait", freshness_ttl=30)
+    with patch.object(mf, "_get_mirror_updated", return_value=(True, "t0")), \
+         patch("proxy.forgejo_api", side_effect=RuntimeError("boom")), \
+         patch.object(proxy.log, "error") as mock_log_error:
+      result = mf.ensure_synced("owner", "repo")
+    assert result is False
+    mock_log_error.assert_called()
+
+  def test_fail_open_non_200_returns_false_no_raise(self):
+    mf = self._freshness(sync_mode="wait", freshness_ttl=30)
+    with patch.object(mf, "_get_mirror_updated", return_value=(True, "t0")), \
+         patch("proxy.forgejo_api", return_value=(500, {"message": "boom"})), \
+         patch.object(proxy.log, "error") as mock_log_error:
+      result = mf.ensure_synced("owner", "repo")
+    assert result is False
+    mock_log_error.assert_called()
+
+  def test_fail_open_network_exception_during_prev_mirror_updated_fetch(self):
+    """_get_mirror_updated (used for the pre-sync snapshot, not mocked away here) must
+    itself swallow a forgejo_api exception (e.g. connection refused / DNS failure) rather
+    than letting it propagate out of ensure_synced."""
+    mf = self._freshness(sync_mode="wait", freshness_ttl=30)
+    with patch("proxy.forgejo_api", side_effect=OSError("connection refused")), \
+         patch.object(proxy.log, "error") as mock_log_error:
+      result = mf.ensure_synced("owner", "repo")
+    assert result is False
+    mock_log_error.assert_called()
+
+  def test_leader_bookkeeping_cleared_after_completion_allows_resync(self):
+    """ensure_synced runs the sync inline (not via a background threading.Thread like
+    trigger_sync), so single-flight dedup across concurrent callers is exercised with real
+    threads below. This test verifies leader/follower bookkeeping (_ensure_inflight) is
+    cleared after a sync completes, so a later call (post-TTL) can trigger a fresh sync
+    rather than being stuck thinking one is still in flight."""
+    mf = self._freshness(sync_mode="wait", freshness_ttl=0)
+    with patch.object(mf, "_get_mirror_updated", side_effect=[(True, "t0"), (True, "t1")]), \
+         patch("proxy.forgejo_api", return_value=(200, {})), \
+         patch("proxy.time.sleep"):
+      assert mf.ensure_synced("owner", "repo") is True
+    assert mf._ensure_inflight == {}
+
+  # -------------------------------------------------------------------------
+  # BUG 1 regression: prev_updated is None/empty (mirror never synced before)
+  # must not cause a false-positive convergence on the very first poll.
+  # -------------------------------------------------------------------------
+
+  def test_prev_updated_none_does_not_falsely_converge_on_first_poll(self):
+    """Freshly created mirror: mirror_updated is legitimately empty (never synced before —
+    Forgejo reports it as ""). This test mocks forgejo_api directly (not _get_mirror_updated),
+    so it exercises the REAL _get_mirror_updated → _run_sync convergence check end to end.
+    A buggy implementation using `current_updated is not None and current_updated != prev_updated`
+    would treat prev="" / current="" as "not None and unchanged"... but treats prev=None /
+    current="" as "not None and CHANGED" — a false positive on the very first poll, since
+    None (missing field) and "" (empty field) are different Python values despite both meaning
+    "never synced". The correct implementation must keep polling until a genuinely non-empty
+    value appears, and time out (False) if that never happens within sync_wait_timeout."""
+    mf = self._freshness(sync_mode="wait", freshness_ttl=30, sync_wait_timeout=0.001)
+    # Pre-snapshot: field absent entirely (None). Every poll: field present but empty ("").
+    # A real Forgejo mirror that has never synced could plausibly report either shape; the
+    # combination here is exactly what triggers the historical bug (prev=None, current="").
+    responses = iter([{"mirror_updated": None}] + [{"mirror_updated": ""}] * 10)
+    def fake_api(method, path, *args, **kwargs):
+      if method == "POST":
+        return 200, {}
+      return 200, next(responses)
+    with patch("proxy.forgejo_api", side_effect=fake_api) as mock_api, \
+         patch("proxy.time.sleep"), \
+         patch.object(proxy.log, "error") as mock_log_error:
+      result = mf.ensure_synced("owner", "repo")
+    assert result is False
+    assert mock_api.call_count >= 2  # prev-snapshot GET + POST, at least one poll GET
+    mock_log_error.assert_called()
+    assert mf._is_fresh("owner/repo") is False
+
+  def test_prev_updated_none_converges_true_once_a_non_empty_value_appears(self):
+    """Same starting point (mirror never synced, mirror_updated absent/empty) but the sync
+    actually completes and mirror_updated becomes non-empty on a later poll — must converge
+    True. Exercises the real _get_mirror_updated via forgejo_api, not a mocked one."""
+    mf = self._freshness(sync_mode="wait", freshness_ttl=30, sync_wait_timeout=30)
+    get_responses = iter([
+      {"mirror_updated": None},   # prev: never synced
+      {"mirror_updated": ""},     # poll 1: still running, field now present but empty
+      {"mirror_updated": "t1"},   # poll 2: converged — real, non-empty value
+    ])
+    def fake_api(method, path, *args, **kwargs):
+      if method == "POST":
+        return 200, {}
+      return 200, next(get_responses)
+    with patch("proxy.forgejo_api", side_effect=fake_api), \
+         patch("proxy.time.sleep"):
+      result = mf.ensure_synced("owner", "repo")
+    assert result is True
+    assert mf._is_fresh("owner/repo") is True
+
+  def test_pre_snapshot_api_failure_returns_false_immediately_no_blind_poll(self):
+    """If the pre-sync mirror_updated snapshot itself fails (API error/exception), there is
+    no baseline to detect convergence against — ensure_synced must fail open immediately
+    rather than blindly polling. mirror-sync POST must not be issued in this case."""
+    mf = self._freshness(sync_mode="wait", freshness_ttl=30)
+    with patch.object(mf, "_get_mirror_updated", return_value=(False, None)) as mock_get, \
+         patch("proxy.forgejo_api") as mock_api, \
+         patch.object(proxy.log, "error") as mock_log_error:
+      result = mf.ensure_synced("owner", "repo")
+    assert result is False
+    mock_get.assert_called_once()
+    mock_api.assert_not_called()
+    mock_log_error.assert_called()
+
+  def test_transient_api_failure_during_poll_does_not_falsely_converge(self):
+    """A transient API failure mid-poll (ok=False) must not be mistaken for convergence —
+    the loop must keep polling (and eventually converge once a real value appears)."""
+    mf = self._freshness(sync_mode="wait", freshness_ttl=30, sync_wait_timeout=30)
+    with patch.object(mf, "_get_mirror_updated", side_effect=[
+           (True, "t0"),    # prev
+           (False, None),   # poll 1: transient API error — must not count as convergence
+           (True, "t1"),    # poll 2: real convergence
+         ]) as mock_get, \
+         patch("proxy.forgejo_api", return_value=(200, {})), \
+         patch("proxy.time.sleep"):
+      result = mf.ensure_synced("owner", "repo")
+    assert result is True
+    assert mock_get.call_count == 3
+
+  # -------------------------------------------------------------------------
+  # BUG 2 regression: unexpected exception in the leader path must not escape
+  # ensure_synced, and must not leave single-flight bookkeeping stuck.
+  # -------------------------------------------------------------------------
+
+  def test_unexpected_exception_in_leader_path_is_caught_fail_open(self):
+    mf = self._freshness(sync_mode="wait", freshness_ttl=30, sync_wait_timeout=30)
+    with patch.object(mf, "_get_mirror_updated", side_effect=[(True, "t0"), (True, "t1")]), \
+         patch("proxy.forgejo_api", return_value=(200, {})), \
+         patch.object(mf, "_mark_fresh", side_effect=RuntimeError("boom")), \
+         patch("proxy.time.sleep"), \
+         patch.object(proxy.log, "error") as mock_log_error:
+      result = mf.ensure_synced("owner", "repo")
+    assert result is False
+    mock_log_error.assert_called()
+    # Bookkeeping must be cleared despite the exception, so a subsequent call can proceed.
+    assert mf._ensure_inflight == {}
+    with patch.object(mf, "_get_mirror_updated", side_effect=[(True, "t0"), (True, "t1")]), \
+         patch("proxy.forgejo_api", return_value=(200, {})), \
+         patch("proxy.time.sleep"):
+      assert mf.ensure_synced("owner", "repo") is True
+
+  # -------------------------------------------------------------------------
+  # BUG 3 regression: the freshness cache must not grow unbounded.
+  # -------------------------------------------------------------------------
+
+  def test_freshness_cache_is_capped(self):
+    """Cache capping is a property of _mark_fresh itself, independent of wait/async — exercised
+    here via wait mode (synchronous, deterministic) since async would require waiting for 25
+    background threads to individually converge."""
+    mf = self._freshness(sync_mode="wait", freshness_ttl=3600, cache_max=10, sync_wait_timeout=5)
+    call_n = {"n": 0}
+
+    def fake_api(method, path, *args, **kwargs):
+      if method == "POST":
+        return 200, {}
+      call_n["n"] += 1
+      return 200, {"mirror_updated": f"t{call_n['n']}"}  # always a fresh, distinct value
+
+    with patch("proxy.forgejo_api", side_effect=fake_api), \
+         patch("proxy.time.sleep"):
+      for i in range(25):
+        assert mf.ensure_synced(f"owner{i}", "repo") is True
+    assert len(mf._last_sync) <= 10
+
+  def test_single_flight_concurrent_real_threads_wait_mode_one_sync_call(self):
+    """Two real threads calling ensure_synced for the same repo concurrently, in wait
+    mode, must coalesce into exactly one mirror-sync POST — the follower joins the
+    leader's in-flight Event rather than triggering its own sync."""
+    mf = self._freshness(sync_mode="wait", freshness_ttl=30, sync_wait_timeout=5)
     entered = threading.Barrier(2, timeout=5)
     release = threading.Event()
-    call_count = {"n": 0}
+    post_count = {"n": 0}
     lock = threading.Lock()
 
-    def fake_run(*args, **kwargs):
+    def fake_api(method, path, *args, **kwargs):
+      if method == "GET":
+        return 200, {"mirror_updated": "t0" if not post_count["n"] else "t1"}
       with lock:
-        call_count["n"] += 1
-      # Block until the test releases us, after confirming both caller threads
-      # are inside upstream_refs (one as leader building the request, the other
-      # as a follower waiting on the leader's Event).
+        post_count["n"] += 1
       release.wait(timeout=5)
-      return self._fake_process(stdout="sha1\trefs/heads/main\n")
+      return 200, {}
 
     results = [None, None]
 
     def leader_worker():
       entered.wait()
-      results[0] = mf.upstream_refs("owner", "repo")
+      results[0] = mf.ensure_synced("owner", "repo")
 
     def follower_worker():
       entered.wait()
-      results[1] = mf.upstream_refs("owner", "repo")
+      results[1] = mf.ensure_synced("owner", "repo")
 
-    with patch("proxy.subprocess.run", side_effect=fake_run):
+    with patch("proxy.forgejo_api", side_effect=fake_api), \
+         patch("proxy.time.sleep"):
       t1 = threading.Thread(target=leader_worker)
       t2 = threading.Thread(target=follower_worker)
       t1.start()
       t2.start()
-      # Give both threads a moment to reach upstream_refs and register
-      # leader/follower state, then let the fake subprocess.run return.
       time.sleep(0.2)
       release.set()
       t1.join(timeout=5)
       t2.join(timeout=5)
 
     assert not t1.is_alive() and not t2.is_alive()
-    assert call_count["n"] == 1
-    assert results[0] == {"refs/heads/main": "sha1"}
-    assert results[1] == {"refs/heads/main": "sha1"}
+    assert post_count["n"] == 1
+    assert results[0] is True
+    assert results[1] is True
 
-  def test_single_flight_follower_gets_none_when_leader_fetch_fails(self):
-    """If the leader's fetch fails (returns None), the follower must also get
-    None promptly — it must not silently serve stale/missing data or hang
-    past its wait timeout."""
-    mf = self._freshness(cache_ttl=30, ls_remote_timeout=1)
-    entered = threading.Barrier(2, timeout=5)
+  def test_single_flight_async_mode_follower_returns_true_without_waiting(self):
+    """In async mode, the leader itself returns immediately after spawning a background
+    thread to do the real sync-and-wait. A follower arriving while that background sync is
+    still in flight must also return True immediately, without waiting for it to finish, and
+    must not trigger a second POST /mirror-sync (single-flight dedup)."""
+    mf = self._freshness(sync_mode="async", freshness_ttl=30, sync_wait_timeout=5)
+    post_started = threading.Event()
     release = threading.Event()
+    post_count = {"n": 0}
+    lock = threading.Lock()
 
-    def fake_run(*args, **kwargs):
+    def fake_api(method, path, *args, **kwargs):
+      if method == "GET":
+        # Pre-snapshot (before POST) is "t0"; once the POST has been released, subsequent
+        # polls report a new value so the background thread converges promptly instead of
+        # spinning to its own sync_wait_timeout.
+        return 200, {"mirror_updated": "t1" if release.is_set() else "t0"}
+      with lock:
+        post_count["n"] += 1
+      post_started.set()
       release.wait(timeout=5)
-      return self._fake_process(stdout="", returncode=1, stderr="fatal: could not read")
+      return 200, {}
 
-    results = [None, None]
+    with patch("proxy.forgejo_api", side_effect=fake_api), \
+         patch("proxy.time.sleep"):
+      # Leader call: spawns the background thread and returns immediately (does not block
+      # on fake_api itself — the background thread does).
+      leader_result = mf.ensure_synced("owner", "repo")
+      assert leader_result is True
 
-    def leader_worker():
-      entered.wait()
-      results[0] = mf.upstream_refs("owner", "repo")
+      # Wait for the background thread to actually reach the POST call, proving the
+      # background sync is genuinely in flight before the follower shows up.
+      assert post_started.wait(timeout=5)
 
-    def follower_worker():
-      entered.wait()
-      results[1] = mf.upstream_refs("owner", "repo")
+      # Follower call: sync still in flight (background thread blocked in fake_api's POST).
+      # Must return True immediately without waiting and without a second POST.
+      follower_result = mf.ensure_synced("owner", "repo")
+      assert follower_result is True
+      assert post_count["n"] == 1, "follower must not trigger a second mirror-sync POST"
 
-    with patch("proxy.subprocess.run", side_effect=fake_run):
-      t1 = threading.Thread(target=leader_worker)
-      t2 = threading.Thread(target=follower_worker)
-      t1.start()
-      t2.start()
-      time.sleep(0.2)
       release.set()
-      t1.join(timeout=5)
-      t2.join(timeout=5)
+      deadline = time.monotonic() + 5
+      while mf._ensure_inflight and time.monotonic() < deadline:
+        time.sleep(0.01)
 
-    assert not t1.is_alive() and not t2.is_alive()
-    assert results[0] is None
-    assert results[1] is None
-
-
-# ---------------------------------------------------------------------------
-# MirrorFreshness.wait_for_ref_sync — real implementation, only forgejo_refs mocked
-# ---------------------------------------------------------------------------
-
-class TestWaitForRefSync:
-  def _freshness(self, **kwargs):
-    return proxy.MirrorFreshness(
-      forgejo_url="http://forgejo.local",
-      forgejo_user="gitadmin",
-      forgejo_password="pw",
-      **kwargs,
-    )
-
-  def test_expected_present_immediately_returns_true(self):
-    mf = self._freshness()
-    expected = {"refs/heads/main": "sha1"}
-    with patch.object(mf, "forgejo_refs", return_value=dict(expected)) as mock_refs, \
-         patch("proxy.time.sleep") as mock_sleep:
-      assert mf.wait_for_ref_sync("owner", "repo", expected, timeout=5) is True
-    mock_refs.assert_called_once_with("owner", "repo")
-    mock_sleep.assert_not_called()
-
-  def test_converges_after_a_few_polls(self):
-    mf = self._freshness()
-    expected = {"refs/heads/main": "sha1", "refs/tags/v1.0.0": "sha2"}
-    # First poll: only one of the two expected refs present (mirror not yet synced).
-    # Second poll: both present.
-    side_effects = [
-      {"refs/heads/main": "sha1"},
-      dict(expected),
-    ]
-    with patch.object(mf, "forgejo_refs", side_effect=side_effects) as mock_refs, \
-         patch("proxy.time.sleep") as mock_sleep:
-      assert mf.wait_for_ref_sync("owner", "repo", expected, timeout=5) is True
-    assert mock_refs.call_count == 2
-    mock_sleep.assert_called_once_with(1.5)
-
-  def test_extra_refs_in_mirror_are_ignored(self):
-    mf = self._freshness()
-    expected = {"refs/heads/main": "sha1"}
-    current = {"refs/heads/main": "sha1", "refs/heads/other": "sha_extra", "refs/tags/v9.9.9": "sha_extra2"}
-    with patch.object(mf, "forgejo_refs", return_value=current), \
-         patch("proxy.time.sleep") as mock_sleep:
-      assert mf.wait_for_ref_sync("owner", "repo", expected, timeout=5) is True
-    mock_sleep.assert_not_called()
-
-  def test_never_converges_times_out_false(self):
-    mf = self._freshness()
-    expected = {"refs/heads/main": "sha_new"}
-    stale = {"refs/heads/main": "sha_old"}
-    with patch.object(mf, "forgejo_refs", return_value=stale), \
-         patch("proxy.time.sleep"):
-      assert mf.wait_for_ref_sync("owner", "repo", expected, timeout=0) is False
-
-  def test_forgejo_refs_none_on_some_polls_does_not_crash_and_times_out(self):
-    mf = self._freshness()
-    expected = {"refs/heads/main": "sha1"}
-    # Always None (simulating persistent forgejo ls-remote errors) — must not
-    # raise, and must eventually time out rather than hang.
-    with patch.object(mf, "forgejo_refs", return_value=None), \
-         patch("proxy.time.sleep"):
-      assert mf.wait_for_ref_sync("owner", "repo", expected, timeout=0) is False
-
-
-# ---------------------------------------------------------------------------
-# MirrorFreshness.ensure_fresh
-# ---------------------------------------------------------------------------
-
-class TestEnsureFresh:
-  def _freshness(self):
-    return proxy.MirrorFreshness(
-      forgejo_url="http://forgejo.local",
-      forgejo_user="gitadmin",
-      forgejo_password="pw",
-    )
-
-  def test_refs_match_returns_true_without_sync(self):
-    mf = self._freshness()
-    refs = {"refs/heads/main": "sha1"}
-    with patch.object(mf, "upstream_refs", return_value=refs), \
-         patch.object(mf, "forgejo_refs", return_value=dict(refs)), \
-         patch.object(mf, "trigger_sync") as mock_trigger:
-      assert mf.ensure_fresh("owner", "repo") is True
-    mock_trigger.assert_not_called()
-
-  def test_refs_differ_triggers_sync_and_waits(self):
-    mf = self._freshness()
-    upstream = {"refs/heads/main": "sha2"}
-    current = {"refs/heads/main": "sha1"}
-    with patch.object(mf, "upstream_refs", return_value=upstream), \
-         patch.object(mf, "forgejo_refs", return_value=current), \
-         patch.object(mf, "trigger_sync") as mock_trigger, \
-         patch.object(mf, "wait_for_ref_sync", return_value=True) as mock_wait:
-      assert mf.ensure_fresh("owner", "repo") is True
-    mock_trigger.assert_called_once_with("owner", "repo")
-    mock_wait.assert_called_once_with("owner", "repo", upstream)
-
-  def test_refs_differ_and_wait_times_out_returns_false(self):
-    mf = self._freshness()
-    upstream = {"refs/heads/main": "sha2"}
-    current = {"refs/heads/main": "sha1"}
-    with patch.object(mf, "upstream_refs", return_value=upstream), \
-         patch.object(mf, "forgejo_refs", return_value=current), \
-         patch.object(mf, "trigger_sync"), \
-         patch.object(mf, "wait_for_ref_sync", return_value=False):
-      assert mf.ensure_fresh("owner", "repo") is False
-
-  def test_upstream_error_returns_false_fail_open_no_sync(self):
-    mf = self._freshness()
-    with patch.object(mf, "upstream_refs", return_value=None), \
-         patch.object(mf, "forgejo_refs") as mock_forgejo_refs, \
-         patch.object(mf, "trigger_sync") as mock_trigger:
-      assert mf.ensure_fresh("owner", "repo") is False
-    mock_forgejo_refs.assert_not_called()
-    mock_trigger.assert_not_called()
-
-  def test_forgejo_refs_error_returns_false(self):
-    mf = self._freshness()
-    with patch.object(mf, "upstream_refs", return_value={"refs/heads/main": "sha1"}), \
-         patch.object(mf, "forgejo_refs", return_value=None), \
-         patch.object(mf, "trigger_sync") as mock_trigger:
-      assert mf.ensure_fresh("owner", "repo") is False
-    mock_trigger.assert_not_called()
+    assert mf._ensure_inflight == {}
+    assert post_count["n"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -564,31 +747,33 @@ class TestHandleGitRequest:
     handler.wait_for_mirror.assert_called_once_with("owner", "repo")
     handler.proxy_to_forgejo.assert_called_once_with("owner", "repo")
 
-  def test_populated_mirror_info_refs_upload_pack_calls_ensure_fresh(self):
+  def test_populated_mirror_info_refs_upload_pack_calls_ensure_synced(self):
     handler = self._handler(
       "/owner/repo/info/refs?service=git-upload-pack",
       command="GET",
     )
     with patch.object(proxy, "get_mirror", return_value={"empty": False}):
       handler.handle_git_request()
-    handler.server.freshness.ensure_fresh.assert_called_once_with("owner", "repo")
+    handler.server.freshness.ensure_synced.assert_called_once_with("owner", "repo")
     handler.proxy_to_forgejo.assert_called_once_with("owner", "repo")
 
-  def test_populated_mirror_non_info_refs_request_skips_ensure_fresh(self):
+  def test_populated_mirror_post_git_upload_pack_calls_ensure_synced(self):
+    """POST .../git-upload-pack is where the client sends `want <sha>` lines, including
+    arbitrary commit SHAs — this must also trigger ensure_synced."""
     handler = self._handler("/owner/repo/git-upload-pack", command="POST")
     with patch.object(proxy, "get_mirror", return_value={"empty": False}):
       handler.handle_git_request()
-    handler.server.freshness.ensure_fresh.assert_not_called()
+    handler.server.freshness.ensure_synced.assert_called_once_with("owner", "repo")
     handler.proxy_to_forgejo.assert_called_once_with("owner", "repo")
 
-  def test_populated_mirror_get_info_refs_wrong_service_skips_ensure_fresh(self):
+  def test_populated_mirror_get_info_refs_wrong_service_skips_ensure_synced(self):
     handler = self._handler(
       "/owner/repo/info/refs?service=git-receive-pack",
       command="GET",
     )
     with patch.object(proxy, "get_mirror", return_value={"empty": False}):
       handler.handle_git_request()
-    handler.server.freshness.ensure_fresh.assert_not_called()
+    handler.server.freshness.ensure_synced.assert_not_called()
     handler.proxy_to_forgejo.assert_called_once_with("owner", "repo")
 
   def test_invalid_owner_repo_rejected_with_400(self):

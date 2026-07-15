@@ -19,7 +19,6 @@ import logging
 import os
 import re
 import shlex
-import subprocess
 import threading
 import time
 import urllib.parse
@@ -43,10 +42,9 @@ FORGEJO_API_TIMEOUT = 30
 FORGEJO_MIGRATE_TIMEOUT = 1800  # large repos can take time
 PROXY_TIMEOUT = 300
 MIRROR_WAIT_TIMEOUT = 300  # how long to poll for mirror to become ready
-LS_REMOTE_TIMEOUT = 20  # seconds for `git ls-remote` to upstream (DNS+TLS+ref enumeration on large repos)
-LS_REMOTE_CACHE_TTL = 30  # seconds to cache upstream refs
-LS_REMOTE_CACHE_MAX = 1000  # cap on number of cached repos to prevent unbounded growth
-REF_SYNC_WAIT_TIMEOUT = 120  # how long to wait after triggering sync for refs to converge
+SYNC_FRESHNESS_TTL = int(os.environ.get("PROXY_SYNC_TTL", "30"))  # seconds a mirror is considered fresh after a successful sync
+SYNC_WAIT_TIMEOUT = 120  # how long to wait (mode=wait) for mirror-sync to complete, polling mirror_updated
+SYNC_CACHE_MAX = 1000  # cap on number of repos tracked in the freshness cache to prevent unbounded growth
 
 # Allowed characters in GitHub owner/repo names
 _NAME_RE = re.compile(r'^[A-Za-z0-9_.-]{1,100}$')
@@ -83,6 +81,12 @@ log.propagate = False
 
 if not FORGEJO_TOKEN:
   log.warning("FORGEJO_TOKEN is not set — API calls will fail with 401")
+
+_SYNC_MODES = frozenset({"wait", "async"})
+SYNC_MODE = os.environ.get("PROXY_SYNC_MODE", "wait")  # "wait" (default) or "async"
+if SYNC_MODE not in _SYNC_MODES:
+  log.warning("invalid PROXY_SYNC_MODE, falling back to 'wait'", extra={"value": SYNC_MODE})
+  SYNC_MODE = "wait"
 
 PROXY_CONFIG_PATH = os.environ.get("PROXY_CONFIG", "/config/hooks.yml")
 _proxy_config = None
@@ -155,149 +159,222 @@ def create_mirror(owner: str, repo: str):
   t.start()
 
 
-def _parse_ls_remote(output: str) -> dict[str, str]:
-  refs = {}
-  for line in output.splitlines():
-    parts = line.split("\t", 1)
-    if len(parts) != 2:
-      continue
-    name = parts[1]
-    # Peeled tag entries (`refs/tags/v1^{}`) are emitted on one side but possibly
-    # not the other depending on git version; comparing them would create spurious diffs.
-    if name.endswith("^{}"):
-      continue
-    if name.startswith("refs/heads/") or name.startswith("refs/tags/"):
-      refs[name] = parts[0]
-  return refs
-
-
 class MirrorFreshness:
-  """Encapsulates per-repo freshness state: upstream ls-remote cache, in-flight ls-remote
-  events, in-flight mirror-sync flags. One global instance is created in __main__ and
-  injected into the ProxyHandler via the server reference."""
+  """Encapsulates per-repo freshness state: a freshness cache (recent-sync timestamps) and
+  in-flight mirror-sync tracking for single-flight dedup. One global instance is created in
+  __main__ and injected into the ProxyHandler via the server reference.
+
+  Freshness model: sync-on-demand. Instead of comparing refs between GitHub and the mirror,
+  we simply ask Forgejo to mirror-sync and (in "wait" mode) wait for it to actually finish,
+  or (in "async" mode) trigger it and return immediately, serving whatever the mirror
+  currently has. A short freshness cache (freshness_ttl) avoids syncing on every request."""
 
   def __init__(self, forgejo_url: str, forgejo_user: str, forgejo_password: str,
-               cache_ttl: int = LS_REMOTE_CACHE_TTL, cache_max: int = LS_REMOTE_CACHE_MAX,
-               ls_remote_timeout: int = LS_REMOTE_TIMEOUT, sync_wait_timeout: int = REF_SYNC_WAIT_TIMEOUT):
+               sync_mode: str = "wait", freshness_ttl: int = 30, sync_wait_timeout: int = 120,
+               cache_max: int = SYNC_CACHE_MAX):
     self._forgejo_url = forgejo_url
     self._forgejo_user = forgejo_user
     self._forgejo_password = forgejo_password
-    self._cache_ttl = cache_ttl
-    self._cache_max = cache_max
-    self._ls_remote_timeout = ls_remote_timeout
+    self._sync_mode = sync_mode
+    self._freshness_ttl = freshness_ttl
     self._sync_wait_timeout = sync_wait_timeout
-    self._upstream_cache: "OrderedDict[str, tuple[float, dict[str, str]]]" = OrderedDict()
-    self._cache_lock = threading.Lock()
-    self._inflight_ls_remote: dict[str, threading.Event] = {}
+    self._cache_max = cache_max
+    self._last_sync: "OrderedDict[str, float]" = OrderedDict()
+    self._freshness_lock = threading.Lock()
+    # Single-flight for trigger_sync() (fire-and-forget dedup, used for empty mirrors).
     self._sync_triggered: set[str] = set()
     self._sync_lock = threading.Lock()
+    # Single-flight for ensure_synced() (sync-on-demand dedup, independent of the above:
+    # ensure_synced needs to know when the leader's sync *finished*, not just that one
+    # was fired off, so followers in "wait" mode can join it).
+    self._ensure_inflight: dict[str, threading.Event] = {}
+    self._ensure_lock = threading.Lock()
 
-  def upstream_refs(self, owner: str, repo: str) -> dict[str, str] | None:
-    """Returns {refname: sha} for refs/heads/* and refs/tags/* on GitHub, or None on error.
-    Single-flight: concurrent calls for the same repo coalesce into one ls-remote.
-    Edge case: empty upstream repo returns empty dict (not None)."""
+  def _is_fresh(self, key: str) -> bool:
+    with self._freshness_lock:
+      last = self._last_sync.get(key)
+      return last is not None and time.monotonic() - last < self._freshness_ttl
+
+  def _mark_fresh(self, key: str):
+    with self._freshness_lock:
+      self._last_sync[key] = time.monotonic()
+      self._last_sync.move_to_end(key)
+      while len(self._last_sync) > self._cache_max:
+        self._last_sync.popitem(last=False)
+
+  def _get_mirror_updated(self, owner: str, repo: str, timeout: float = FORGEJO_API_TIMEOUT) -> tuple[bool, str | None]:
+    """Returns (ok, value): ok=False means the API call itself failed (exception / non-200) —
+    the caller cannot trust `value` at all in that case. ok=True means the request succeeded;
+    `value` is the `mirror_updated` field, which may legitimately be None/empty (mirror never
+    synced yet) — that is NOT an error and must not be conflated with an API failure.
+    `timeout` bounds the underlying HTTP call so the poll loop can honor its own deadline."""
+    name = mirror_name(owner, repo)
+    try:
+      status, data = forgejo_api("GET", f"/repos/{self._forgejo_user}/{name}", timeout=timeout)
+    except Exception as e:
+      log.error("get mirror_updated exception", extra={"repo": f"{owner}/{repo}", "error": str(e)})
+      return False, None
+    if status != 200:
+      log.error("get mirror_updated failed", extra={"repo": f"{owner}/{repo}", "status": status})
+      return False, None
+    return True, data.get("mirror_updated")
+
+  def ensure_synced(self, owner: str, repo: str) -> bool:
+    """Ensures the Forgejo mirror is synced with GitHub, sync-on-demand with a freshness cache.
+
+    - If the mirror was synced successfully within freshness_ttl seconds, returns True immediately.
+    - Otherwise triggers (or joins an in-flight) mirror-sync:
+        mode "wait":  waits (polling mirror_updated) up to sync_wait_timeout for the sync to
+                      actually complete, then returns True/False.
+        mode "async": triggers the sync in the background and returns True immediately without
+                      waiting — the caller serves whatever the mirror currently has.
+    Fail-open: never raises; any API/network error or timeout is logged and returns False,
+    the caller proxies regardless."""
     key = f"{owner}/{repo}"
-    with self._cache_lock:
-      cached = self._upstream_cache.get(key)
-      if cached and time.monotonic() - cached[0] < self._cache_ttl:
-        self._upstream_cache.move_to_end(key)
-        return cached[1]
-      inflight = self._inflight_ls_remote.get(key)
+
+    if self._is_fresh(key):
+      return True
+
+    with self._ensure_lock:
+      inflight = self._ensure_inflight.get(key)
       is_leader = inflight is None
       if is_leader:
         inflight = threading.Event()
-        self._inflight_ls_remote[key] = inflight
+        self._ensure_inflight[key] = inflight
 
     if not is_leader:
-      inflight.wait(timeout=self._ls_remote_timeout + 5)
-      with self._cache_lock:
-        cached = self._upstream_cache.get(key)
-        # Apply same TTL check as the fast path: if the only available entry is older
-        # than cache_ttl (e.g. leader's fetch failed and left a stale entry), report None
-        # so callers see the failure rather than silently serving stale data.
-        if cached and time.monotonic() - cached[0] < self._cache_ttl:
-          return cached[1]
-        return None
+      if self._sync_mode == "async":
+        # Don't wait for someone else's sync in async mode — serve current mirror state.
+        return True
+      if not inflight.wait(timeout=self._sync_wait_timeout + 5):
+        log.error("ensure_synced: timed out waiting for in-flight sync", extra={"repo": key})
+        return False
+      return self._is_fresh(key)
+
+    if self._sync_mode == "async":
+      # Leader kicks off a background thread that does the real POST + wait-for-completion
+      # + _mark_fresh, and only THAT thread releases _ensure_inflight[key] when it's done.
+      # ensure_synced itself returns immediately without waiting, so the caller serves
+      # whatever the mirror currently has — but the mirror is only ever marked fresh once
+      # the background sync has genuinely completed, never optimistically.
+      t = threading.Thread(target=self._run_sync_async_bg, args=(owner, repo, key, inflight), daemon=True)
+      try:
+        t.start()
+      except Exception as e:
+        # If the thread can't start (e.g. RuntimeError under thread/fd exhaustion), the
+        # background body's finally never runs, so we MUST release the in-flight slot here —
+        # otherwise the key stays stuck forever and this repo silently stops being synced.
+        log.error("ensure_synced: failed to start async sync thread", extra={"repo": key, "error": str(e)})
+        with self._ensure_lock:
+          self._ensure_inflight.pop(key, None)
+        inflight.set()
+        return False
+      return True
 
     try:
-      return self._fetch_upstream_refs(owner, repo, key)
+      try:
+        return self._run_sync_wait(owner, repo, key)
+      except Exception as e:
+        # Belt-and-braces: _run_sync_wait already guards its own forgejo_api calls, but this
+        # outer catch makes the "never raises" contract structural rather than incidental
+        # to which lines happen to have a try/except today (e.g. _mark_fresh, time.sleep).
+        log.error("ensure_synced: unexpected exception in leader sync", extra={"repo": key, "error": str(e)})
+        return False
     finally:
-      with self._cache_lock:
-        self._inflight_ls_remote.pop(key, None)
+      with self._ensure_lock:
+        self._ensure_inflight.pop(key, None)
       inflight.set()
 
-  def _fetch_upstream_refs(self, owner: str, repo: str, key: str) -> dict[str, str] | None:
-    url = f"{GITHUB_BASE}/{owner}/{repo}.git"
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    start = time.monotonic()
+  def _run_sync_wait(self, owner: str, repo: str, key: str) -> bool:
+    """Leader path for sync_mode="wait": POST mirror-sync, then synchronously wait for it
+    to actually complete (or time out), returning True/False accordingly. Wrapped by
+    ensure_synced in a blanket try/except so an unexpected exception anywhere in here (not
+    just around the forgejo_api calls) still honors the fail-open contract."""
+    ok, prev_updated = self._get_mirror_updated(owner, repo)
+    if not ok:
+      # Couldn't even get a pre-sync snapshot — fail open without a blind poll loop,
+      # which would otherwise have no baseline to detect convergence against.
+      log.error("mirror-sync aborted: could not fetch pre-sync mirror_updated", extra={"repo": key})
+      return False
+
+    if not self._trigger_mirror_sync(owner, repo, key):
+      return False
+
+    if self._wait_for_sync_completion(owner, repo, key, prev_updated):
+      self._mark_fresh(key)
+      return True
+    return False
+
+  def _run_sync_async_bg(self, owner: str, repo: str, key: str, inflight: threading.Event):
+    """Background thread body for sync_mode="async": POST mirror-sync, wait for it to
+    actually complete (same criterion as "wait" mode), and only mark the mirror fresh if it
+    genuinely converged — never optimistically. Always releases _ensure_inflight[key] and
+    the inflight Event in `finally`, even on an unexpected exception, so the key never gets
+    stuck and a later call (after this one finishes, successfully or not) can start fresh."""
     try:
-      result = subprocess.run(
-        ["git", "ls-remote", url, "refs/heads/*", "refs/tags/*"],
-        capture_output=True, text=True, timeout=self._ls_remote_timeout, env=env,
-      )
-    except subprocess.TimeoutExpired:
-      log.error("upstream ls-remote timeout", extra={"repo": key, "timeout_s": self._ls_remote_timeout, "result": "timeout"})
-      return None
+      ok, prev_updated = self._get_mirror_updated(owner, repo)
+      if not ok:
+        log.error("mirror-sync (async bg) aborted: could not fetch pre-sync mirror_updated", extra={"repo": key})
+        return
+      if not self._trigger_mirror_sync(owner, repo, key):
+        return
+      if self._wait_for_sync_completion(owner, repo, key, prev_updated):
+        self._mark_fresh(key)
     except Exception as e:
-      log.error("upstream ls-remote exception", extra={
-        "repo": key, "elapsed_ms": int((time.monotonic() - start) * 1000),
-        "error": str(e), "result": "exception",
-      })
-      return None
+      log.error("mirror-sync (async bg) unexpected exception", extra={"repo": key, "error": str(e)})
+    finally:
+      with self._ensure_lock:
+        self._ensure_inflight.pop(key, None)
+      inflight.set()
 
-    elapsed_ms = int((time.monotonic() - start) * 1000)
-    if result.returncode != 0:
-      log.error("upstream ls-remote non-zero rc", extra={
-        "repo": key, "rc": result.returncode, "elapsed_ms": elapsed_ms,
-        "stderr": result.stderr.strip()[:200], "result": "error",
-      })
-      return None
-
-    refs = _parse_ls_remote(result.stdout)
-    log.info("upstream ls-remote ok", extra={"repo": key, "elapsed_ms": elapsed_ms, "refs_count": len(refs), "result": "ok"})
-    with self._cache_lock:
-      self._upstream_cache[key] = (time.monotonic(), refs)
-      self._upstream_cache.move_to_end(key)
-      while len(self._upstream_cache) > self._cache_max:
-        self._upstream_cache.popitem(last=False)
-    return refs
-
-  def forgejo_refs(self, owner: str, repo: str) -> dict[str, str] | None:
-    """Returns {refname: sha} for refs/heads/* and refs/tags/* in the Forgejo mirror, or None on error.
-    Credentials are passed via GIT_CONFIG_* env vars to avoid leaking the basic-auth header in argv."""
+  def _trigger_mirror_sync(self, owner: str, repo: str, key: str) -> bool:
+    """POSTs /mirror-sync. Returns True on 200, False (logged) on any error/exception."""
     name = mirror_name(owner, repo)
-    key = f"{owner}/{repo}"
-    url = f"{self._forgejo_url}/{self._forgejo_user}/{name}.git"
-    header = f"Authorization: Basic {base64.b64encode(f'{self._forgejo_user}:{self._forgejo_password}'.encode()).decode()}"
-    env = {
-      **os.environ,
-      "GIT_TERMINAL_PROMPT": "0",
-      "GIT_CONFIG_COUNT": "1",
-      "GIT_CONFIG_KEY_0": "http.extraHeader",
-      "GIT_CONFIG_VALUE_0": header,
-    }
-    start = time.monotonic()
     try:
-      result = subprocess.run(
-        ["git", "ls-remote", url, "refs/heads/*", "refs/tags/*"],
-        capture_output=True, text=True, timeout=self._ls_remote_timeout, env=env,
-      )
+      status, data = forgejo_api("POST", f"/repos/{self._forgejo_user}/{name}/mirror-sync")
     except Exception as e:
-      log.error("forgejo ls-remote exception", extra={
-        "repo": key, "elapsed_ms": int((time.monotonic() - start) * 1000),
-        "error": str(e), "result": "exception",
-      })
-      return None
+      log.error("mirror-sync api exception", extra={"repo": key, "error": str(e)})
+      return False
+    if status != 200:
+      log.error("mirror-sync api error", extra={"repo": key, "status": status, "body": str(data)[:200]})
+      return False
+    log.info("mirror-sync triggered", extra={"repo": key, "sync_mode": self._sync_mode})
+    return True
 
-    if result.returncode != 0:
-      log.error("forgejo ls-remote non-zero rc", extra={
-        "repo": key, "rc": result.returncode,
-        "elapsed_ms": int((time.monotonic() - start) * 1000),
-        "stderr": result.stderr.strip()[:200], "result": "error",
-      })
-      return None
+  def _wait_for_sync_completion(self, owner: str, repo: str, key: str, prev_updated: str | None) -> bool:
+    """Polls mirror_updated until it transitions to a genuinely new, non-empty value (relative
+    to prev_updated), or sync_wait_timeout elapses. Shared by the "wait" leader path and the
+    "async" background thread — the completion criterion is identical either way; only who
+    waits for it (the client vs. a background thread) differs. Does NOT call _mark_fresh —
+    that's the caller's responsibility on True. A prev_updated of None/"" means the mirror
+    never synced before; in that case any non-None/non-empty current value that differs from
+    prev_updated counts (covers the common "freshly created mirror" case without falsely
+    declaring victory on the very first poll)."""
+    start = time.monotonic()
+    deadline = start + self._sync_wait_timeout
+    while time.monotonic() < deadline:
+      time.sleep(1.5)
+      # Bound the poll's HTTP call by the time left until the deadline, so a single slow/hung
+      # request can't overrun sync_wait_timeout by up to a full FORGEJO_API_TIMEOUT.
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+        break
+      ok, current_updated = self._get_mirror_updated(owner, repo, timeout=min(FORGEJO_API_TIMEOUT, remaining))
+      if not ok:
+        # Transient API error while polling — don't treat it as convergence, just keep
+        # polling until the timeout.
+        continue
+      if current_updated and current_updated != prev_updated:
+        log.info("mirror-sync converged", extra={
+          "repo": key, "elapsed_ms": int((time.monotonic() - start) * 1000), "result": "ok",
+        })
+        return True
 
-    return _parse_ls_remote(result.stdout)
+    log.error("mirror-sync did not converge", extra={
+      "repo": key, "timeout_s": self._sync_wait_timeout,
+      "elapsed_ms": int((time.monotonic() - start) * 1000), "result": "timeout",
+    })
+    return False
 
   def trigger_sync(self, owner: str, repo: str) -> bool:
     """Triggers Forgejo mirror-sync via API. Returns False if a sync is already in flight."""
@@ -325,48 +402,6 @@ class MirrorFreshness:
       with self._sync_lock:
         self._sync_triggered.discard(key)
 
-  def wait_for_ref_sync(self, owner: str, repo: str, expected: dict[str, str],
-                        timeout: int | None = None) -> bool:
-    """Polls Forgejo refs until every (refname, sha) in `expected` is present in the mirror,
-    or timeout expires. Extra refs in the mirror are ignored. Returns True on match, False on timeout."""
-    timeout = timeout if timeout is not None else self._sync_wait_timeout
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-      current = self.forgejo_refs(owner, repo)
-      if current is not None and all(current.get(r) == s for r, s in expected.items()):
-        return True
-      time.sleep(1.5)
-    return False
-
-  def ensure_fresh(self, owner: str, repo: str) -> bool:
-    """Compares Forgejo mirror refs with upstream (heads+tags only). If they differ,
-    triggers mirror-sync and waits up to sync_wait_timeout. On any upstream error: logs and
-    returns False (fail-open — caller still proxies). Returns True if mirror is/became in sync."""
-    key = f"{owner}/{repo}"
-    upstream = self.upstream_refs(owner, repo)
-    if upstream is None:
-      return False
-    current = self.forgejo_refs(owner, repo)
-    if current is None:
-      return False
-    if current == upstream:
-      return True
-
-    added = sum(1 for r in upstream if r not in current)
-    changed = sum(1 for r, s in upstream.items() if r in current and current[r] != s)
-    removed = sum(1 for r in current if r not in upstream)
-    log.info("mirror stale", extra={"repo": key, "added": added, "changed": changed, "removed": removed})
-    self.trigger_sync(owner, repo)
-    start = time.monotonic()
-    if self.wait_for_ref_sync(owner, repo, upstream):
-      log.info("mirror converged", extra={"repo": key, "elapsed_ms": int((time.monotonic() - start) * 1000), "result": "ok"})
-      return True
-    log.error("mirror did not converge", extra={
-      "repo": key, "timeout_s": self._sync_wait_timeout,
-      "elapsed_ms": int((time.monotonic() - start) * 1000), "result": "timeout",
-    })
-    return False
-
 
 def pkt_line(s: str) -> bytes:
   data = s.encode()
@@ -380,6 +415,19 @@ def git_error_body(message: str) -> bytes:
     + b"0000"
     + pkt_line(f"ERR {message}")
   )
+
+
+def _is_upload_pack_request(parts: list[str], command: str, path: str) -> bool:
+  """True for the two request shapes that need mirror freshness: the ref advertisement
+  (GET .../info/refs?service=git-upload-pack) and the actual fetch (POST .../git-upload-pack,
+  which carries `want <sha>` lines — including arbitrary commit SHAs, not just branch tips)."""
+  if command == "GET" and len(parts) == 4 and parts[2] == "info" and parts[3] == "refs":
+    query = path.split("?", 1)[1] if "?" in path else ""
+    service = urllib.parse.parse_qs(query).get("service", [""])[0]
+    return service == "git-upload-pack"
+  if command == "POST" and path.split("?")[0].endswith("/git-upload-pack"):
+    return True
+  return False
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -542,11 +590,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
       self.send_git_error("mirror is syncing, retry in a moment")
       return
 
-    if self.command == "GET" and len(parts) == 4 and parts[2] == "info" and parts[3] == "refs":
-      query = self.path.split("?", 1)[1] if "?" in self.path else ""
-      service = urllib.parse.parse_qs(query).get("service", [""])[0]
-      if service == "git-upload-pack":
-        freshness.ensure_fresh(owner, repo)
+    if _is_upload_pack_request(parts, self.command, self.path):
+      synced = freshness.ensure_synced(owner, repo)
+      log.info("ensure_synced result", extra={"repo": f"{owner}/{repo}", "synced": synced})
 
     self.proxy_to_forgejo(owner, repo)
 
@@ -591,7 +637,12 @@ if __name__ == "__main__":
   else:
     log.info("no hook config loaded — webhook functionality disabled")
 
-  log.info("git-proxy starting", extra={"port": LISTEN_PORT, "forgejo_url": FORGEJO_URL, "forgejo_user": FORGEJO_USER})
+  log.info("git-proxy starting", extra={
+    "port": LISTEN_PORT, "forgejo_url": FORGEJO_URL, "forgejo_user": FORGEJO_USER, "sync_mode": SYNC_MODE,
+  })
   server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), ProxyHandler)
-  server.freshness = MirrorFreshness(FORGEJO_URL, FORGEJO_USER, FORGEJO_PASSWORD)
+  server.freshness = MirrorFreshness(
+    FORGEJO_URL, FORGEJO_USER, FORGEJO_PASSWORD,
+    sync_mode=SYNC_MODE, freshness_ttl=SYNC_FRESHNESS_TTL, sync_wait_timeout=SYNC_WAIT_TIMEOUT,
+  )
   server.serve_forever()
