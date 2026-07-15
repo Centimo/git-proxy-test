@@ -81,6 +81,76 @@ git config --global url."http://<proxy-host>:8080/".insteadOf "https://github.co
 > Ограничение: если `owner` или `repo` сами содержат `__`, обратный разбор имени
 > (`hooks.py:_parse_mirror_full_name`) неоднозначен. Известное ограничение схемы-делимитера.
 
+## Интеграция с GitLab CI
+
+Задача — чтобы `git clone https://github.com/...` из джоб (и клон сабмодулей, указывающих на
+github.com) уходил на прокси. Подмену задаёт git-опция `url.<base>.insteadOf`. Удобнее всего
+пробрасывать её **через переменные окружения** `GIT_CONFIG_COUNT/KEY_0/VALUE_0` — git читает их
+глобально, поэтому подмена действует и на фазу `get_sources`, и на инициализацию сабмодулей
+(до `before_script`), а не только на явные `git clone` в скрипте. Требуется git ≥ 2.31 на раннере.
+
+Значения переменных (общие для всех вариантов ниже):
+
+```
+GIT_CONFIG_COUNT=1
+GIT_CONFIG_KEY_0=url.http://<proxy-host>:8080/.insteadOf
+GIT_CONFIG_VALUE_0=https://github.com/
+```
+
+### На весь раннер (`config.toml`)
+
+Подмена применяется ко всем джобам раннера. Для docker-executor'а:
+
+```toml
+[[runners]]
+  [runners.docker]
+    environment = [
+      "GIT_CONFIG_COUNT=1",
+      "GIT_CONFIG_KEY_0=url.http://<proxy-host>:8080/.insteadOf",
+      "GIT_CONFIG_VALUE_0=https://github.com/",
+    ]
+```
+
+Для shell-executor'а — тот же список, но на уровне самого `[[runners]]`:
+
+```toml
+[[runners]]
+  environment = [
+    "GIT_CONFIG_COUNT=1",
+    "GIT_CONFIG_KEY_0=url.http://<proxy-host>:8080/.insteadOf",
+    "GIT_CONFIG_VALUE_0=https://github.com/",
+  ]
+```
+
+### На один проект (`.gitlab-ci.yml`)
+
+Если раннер общий и трогать `config.toml` нельзя:
+
+```yaml
+variables:
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: "url.http://<proxy-host>:8080/.insteadOf"
+  GIT_CONFIG_VALUE_0: "https://github.com/"
+```
+
+### Вложенные контейнеры (`docker run` внутри джобы)
+
+Если джоба сама запускает контейнеры (сборка внутри `docker run`, DinD), переменные
+`GIT_CONFIG_*` из окружения джобы **не попадают** в эти вложенные контейнеры автоматически.
+На этот случай в репозитории есть `docker-wrapper.sh` — он подменяет `docker` в PATH и на каждый
+`docker run` заново прокидывает `-e GIT_CONFIG_COUNT -e GIT_CONFIG_KEY_0 -e GIT_CONFIG_VALUE_0`
+(поддерживает одну git-config пару, индекс `_0`; падает с ошибкой при конфликте, если переменная
+уже передана вручную). Установка на хост раннера — `install-docker-wrapper.sh` (кладёт враппер в
+`/usr/local/bin/docker`).
+
+### Хост раннера напрямую
+
+Для клонов вне CI (или как запасной вариант для shell-раннера) — системный git-config хоста:
+
+```bash
+sudo git config --system url."http://<proxy-host>:8080/".insteadOf "https://github.com/"
+```
+
 ## Webhook → внешняя команда
 
 Отдельная функция (`proxy/hooks.py`), включается только если задан `PROXY_CONFIG` с непустым
@@ -245,10 +315,6 @@ curl -s -u <admin>:<pass> \
   одном контейнере). Отдельный `proxy/Dockerfile` описывает контейнер только с proxy и
   **compose'ом не задействован** — остался от двухконтейнерной схемы. При изменениях правьте
   оба или удалите неиспользуемый.
-- **`git-config`-инжектор.** Локальные (не в git) скрипты `docker-wrapper.sh` /
-  `install-docker-wrapper.sh` подменяют `docker` в PATH и прокидывают `GIT_CONFIG_COUNT/KEY_0/VALUE_0`
-  в каждый `docker run` — чтобы `url.insteadOf` на прокси попадал внутрь любых контейнеров
-  (например, CI-раннеров) без правки их образов. Поддерживают только одну git-config пару (индекс `_0`).
 - **Историческая находка (2026-04-11):** Forgejo при `git clone` во время initial sync
   отдаёт **пустой репозиторий** (`clone` завершается успехом с warning про empty repo),
   без ошибки/блокировки. Поэтому прокси проверяет флаг `empty`, а не только факт существования.
