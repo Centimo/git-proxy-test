@@ -2,14 +2,21 @@
 # Docker wrapper: automatically injects GIT_CONFIG_* variables into every
 # `docker run` call. Exits with an error if the caller already passes any
 # of the injected variables, to prevent silent conflicts.
+#
+# Supports an arbitrary number of git-config pairs: GIT_CONFIG_COUNT=N plus
+# GIT_CONFIG_KEY_0..KEY_{N-1} / GIT_CONFIG_VALUE_0..VALUE_{N-1} (one insteadOf
+# pair per allowlisted upstream host).
 
 REAL_DOCKER=/usr/bin/docker
 
-INJECT_VARS=(
-  GIT_CONFIG_COUNT
-  GIT_CONFIG_KEY_0
-  GIT_CONFIG_VALUE_0
-)
+# Build the list of variables to forward from GIT_CONFIG_COUNT (default 0).
+INJECT_VARS=(GIT_CONFIG_COUNT)
+git_config_count="${GIT_CONFIG_COUNT:-0}"
+if [[ "$git_config_count" =~ ^[0-9]+$ ]]; then
+  for ((idx = 0; idx < git_config_count; idx++)); do
+    INJECT_VARS+=("GIT_CONFIG_KEY_${idx}" "GIT_CONFIG_VALUE_${idx}")
+  done
+fi
 
 if [[ "$1" != "run" ]]; then
   exec "$REAL_DOCKER" "$@"

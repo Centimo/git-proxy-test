@@ -1,5 +1,7 @@
 import pytest
 
+import source
+from source import SourceRepo, SourceRegistry
 from config import HookConfig, load_config, _expand_env, DEFAULT_HOOK_TIMEOUT
 
 
@@ -36,7 +38,7 @@ class TestExpandEnv:
 
 def _hook(**overrides):
   defaults = dict(
-    source_repo="owner/repo",
+    source="github.com/owner/repo",
     tag_pattern="v{version}",
     command=["true"],
     env={},
@@ -79,14 +81,28 @@ class TestMatchTag:
 # ---------------------------------------------------------------------------
 
 class TestHookConfigHelpers:
-  def test_owner(self):
-    assert _hook(source_repo="Centimo/simd").owner() == "Centimo"
+  def test_source_repo_host_and_path(self):
+    src = _hook(source="github.com/Centimo/simd").source_repo()
+    assert src.host == "github.com"
+    assert src.path == "Centimo/simd"
 
-  def test_repo(self):
-    assert _hook(source_repo="Centimo/simd").repo() == "simd"
+  def test_nested_source_repo_path(self):
+    src = _hook(source="gitlab.com/group/sub/repo").source_repo()
+    assert src.host == "gitlab.com"
+    assert src.path == "group/sub/repo"
 
-  def test_source_url(self):
-    assert _hook(source_repo="Centimo/simd").source_url() == "https://github.com/Centimo/simd.git"
+  def test_source_url_github(self):
+    assert _hook(source="github.com/Centimo/simd").source_url() == "https://github.com/Centimo/simd.git"
+
+  def test_source_url_gitlab_nested(self):
+    assert _hook(source="gitlab.com/group/sub/repo").source_url() == "https://gitlab.com/group/sub/repo.git"
+
+  def test_source_url_honours_base_override(self, monkeypatch):
+    monkeypatch.setattr(
+      source, "REGISTRY",
+      SourceRegistry.from_env("gitlab.example.com:8443=https://gitlab.example.com:8443"),
+    )
+    assert _hook(source="gitlab.example.com:8443/g/r").source_url() == "https://gitlab.example.com:8443/g/r.git"
 
 
 # ---------------------------------------------------------------------------
@@ -96,20 +112,27 @@ class TestHookConfigHelpers:
 class TestHookConfigValidation:
   def test_no_slash_raises(self):
     with pytest.raises(ValueError):
-      _hook(source_repo="ownerrepo")
+      _hook(source="githubcom")
 
-  def test_empty_owner_raises(self):
+  def test_empty_host_raises(self):
     with pytest.raises(ValueError):
-      _hook(source_repo="/repo")
+      _hook(source="/repo")
 
-  def test_empty_repo_raises(self):
+  def test_empty_path_raises(self):
     with pytest.raises(ValueError):
-      _hook(source_repo="owner/")
+      _hook(source="github.com/")
 
-  def test_valid_owner_repo_ok(self):
-    hook = _hook(source_repo="owner/repo")
-    assert hook.owner() == "owner"
-    assert hook.repo() == "repo"
+  def test_host_not_allowlisted_raises(self):
+    with pytest.raises(ValueError, match="allowlist"):
+      _hook(source="bitbucket.org/owner/repo")
+
+  def test_valid_source_ok(self):
+    src = _hook(source="github.com/owner/repo").source_repo()
+    assert src == SourceRepo("github.com", "owner/repo")
+
+  def test_nested_subgroup_source_ok(self):
+    src = _hook(source="gitlab.com/group/sub/deep/repo").source_repo()
+    assert src == SourceRepo("gitlab.com", "group/sub/deep/repo")
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +142,7 @@ class TestHookConfigValidation:
 VALID_CONFIG = """
 webhook_secret: supersecret
 hooks:
-  - source_repo: Centimo/simd
+  - source: github.com/Centimo/simd
     tag_pattern: "v{version}"
     command: "./handle.sh"
 """
@@ -153,18 +176,41 @@ class TestLoadConfig:
     assert cfg.webhook_secret == "supersecret"
     assert len(cfg.hooks) == 1
     hook = cfg.hooks[0]
-    assert hook.source_repo == "Centimo/simd"
+    assert hook.source == "github.com/Centimo/simd"
+    assert hook.source_repo() == SourceRepo("github.com", "Centimo/simd")
     assert hook.tag_pattern == "v{version}"
     # string command → wrapped in a shell
     assert hook.command == ["/bin/sh", "-c", "./handle.sh"]
     assert hook.env == {}
     assert hook.timeout == DEFAULT_HOOK_TIMEOUT
 
+  def test_nested_gitlab_source_config(self, tmp_path):
+    cfg_file = tmp_path / "nested.yml"
+    cfg_file.write_text("""
+hooks:
+  - source: gitlab.com/group/sub/conan-common
+    tag_pattern: "v{version}"
+    command: "./handle.sh"
+""")
+    hook = load_config(str(cfg_file)).hooks[0]
+    assert hook.source_repo() == SourceRepo("gitlab.com", "group/sub/conan-common")
+
+  def test_non_allowlisted_source_host_raises(self, tmp_path):
+    cfg_file = tmp_path / "bad_host.yml"
+    cfg_file.write_text("""
+hooks:
+  - source: bitbucket.org/owner/repo
+    tag_pattern: "v{version}"
+    command: "./handle.sh"
+""")
+    with pytest.raises(ValueError, match="allowlist"):
+      load_config(str(cfg_file))
+
   def test_no_webhook_secret_is_none(self, tmp_path):
     cfg_file = tmp_path / "no_secret.yml"
     cfg_file.write_text("""
 hooks:
-  - source_repo: Centimo/simd
+  - source: github.com/Centimo/simd
     tag_pattern: "v{version}"
     command: ["./handle.sh"]
 """)
@@ -176,7 +222,7 @@ hooks:
     cfg_file = tmp_path / "list_cmd.yml"
     cfg_file.write_text("""
 hooks:
-  - source_repo: Centimo/simd
+  - source: github.com/Centimo/simd
     tag_pattern: "v{version}"
     command: ["python3", "handle.py", "--flag"]
 """)
@@ -187,7 +233,7 @@ hooks:
     cfg_file = tmp_path / "env_timeout.yml"
     cfg_file.write_text("""
 hooks:
-  - source_repo: Centimo/simd
+  - source: github.com/Centimo/simd
     tag_pattern: "v{version}"
     command: "./handle.sh"
     timeout: 45
@@ -199,10 +245,10 @@ hooks:
     assert hook.timeout == 45
     assert hook.env == {"TARGET_REPO": "group/conan-common", "RETRIES": "3"}
 
-  @pytest.mark.parametrize("missing_field", ["source_repo", "tag_pattern", "command"])
+  @pytest.mark.parametrize("missing_field", ["source", "tag_pattern", "command"])
   def test_missing_required_hook_field_raises(self, tmp_path, missing_field):
     hook_fields = {
-      "source_repo": "Centimo/simd",
+      "source": "github.com/Centimo/simd",
       "tag_pattern": '"v{version}"',
       "command": '"./handle.sh"',
     }
@@ -221,7 +267,7 @@ hooks:
     cfg_file = tmp_path / "empty_cmd.yml"
     cfg_file.write_text("""
 hooks:
-  - source_repo: Centimo/simd
+  - source: github.com/Centimo/simd
     tag_pattern: "v{version}"
     command: "   "
 """)
@@ -232,7 +278,7 @@ hooks:
     cfg_file = tmp_path / "empty_list_cmd.yml"
     cfg_file.write_text("""
 hooks:
-  - source_repo: Centimo/simd
+  - source: github.com/Centimo/simd
     tag_pattern: "v{version}"
     command: []
 """)
@@ -243,7 +289,7 @@ hooks:
     cfg_file = tmp_path / "empty_prog.yml"
     cfg_file.write_text("""
 hooks:
-  - source_repo: Centimo/simd
+  - source: github.com/Centimo/simd
     tag_pattern: "v{version}"
     command: ["", "arg"]
 """)
@@ -254,7 +300,7 @@ hooks:
     cfg_file = tmp_path / "bad_env.yml"
     cfg_file.write_text("""
 hooks:
-  - source_repo: Centimo/simd
+  - source: github.com/Centimo/simd
     tag_pattern: "v{version}"
     command: "./handle.sh"
     env:
@@ -267,7 +313,7 @@ hooks:
     cfg_file = tmp_path / "hooks_map.yml"
     cfg_file.write_text("""
 hooks:
-  source_repo: Centimo/simd
+  source: github.com/Centimo/simd
   tag_pattern: "v{version}"
   command: "./handle.sh"
 """)
@@ -287,7 +333,7 @@ hooks:
     cfg_file = tmp_path / "bad_timeout.yml"
     cfg_file.write_text("""
 hooks:
-  - source_repo: Centimo/simd
+  - source: github.com/Centimo/simd
     tag_pattern: "v{version}"
     command: "./handle.sh"
     timeout: 0
@@ -300,7 +346,7 @@ hooks:
     cfg_file.write_text("""
 webhook_secret: 12345
 hooks:
-  - source_repo: Centimo/simd
+  - source: github.com/Centimo/simd
     tag_pattern: "v{version}"
     command: "./handle.sh"
 """)
@@ -314,7 +360,7 @@ hooks:
     cfg_file.write_text("""
 webhook_secret: "${WEBHOOK_SECRET}"
 hooks:
-  - source_repo: Centimo/simd
+  - source: github.com/Centimo/simd
     tag_pattern: "v{version}"
     command: "./handle.sh"
     env:

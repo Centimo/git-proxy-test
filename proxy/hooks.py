@@ -21,12 +21,15 @@ import tempfile
 import threading
 
 from config import HookConfig, ProxyConfig
+import source
 
 log = logging.getLogger("git-proxy")
 
 WEBHOOK_PATH = "/webhook/forgejo"
 # git object name: 40 hex chars (sha1) or 64 hex chars (sha256)
 _SHA_RE = re.compile(r'^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$')
+# a single segment of a Forgejo repo full_name (owner or repo name)
+_FULL_NAME_SEG_RE = re.compile(r'^[A-Za-z0-9._-]+$')
 # URL Forgejo will call back — works because container uses host networking
 _PROXY_WEBHOOK_URL = "http://127.0.0.1:{port}/webhook/forgejo"
 
@@ -48,34 +51,14 @@ def _require_init():
     raise RuntimeError("hooks.init() has not been called — forgejo API not available")
 
 
-# ---------------------------------------------------------------------------
-# Mirror name helpers (mirrors proxy.py logic, kept independent)
-# ---------------------------------------------------------------------------
-
-def _mirror_name(owner: str, repo: str) -> str:
-  return f"{owner}__{repo}"
-
-
-def _parse_mirror_full_name(full_name: str) -> tuple[str, str] | None:
-  """
-  Reverse of mirror_name: "gitadmin/Centimo__simd" → ("Centimo", "simd").
-  Returns None if the name doesn't match the expected pattern.
-
-  Note: ambiguous if owner or repo themselves contain "__" — this is a
-  known limitation of the "__" delimiter scheme used by proxy.py.
-  """
-  slash_pos = full_name.find('/')
-  if slash_pos < 0:
-    return None
-  mirror_part = full_name[slash_pos + 1:]
-  dunder_pos = mirror_part.find('__')
-  if dunder_pos < 0:
-    return None
-  owner = mirror_part[:dunder_pos]
-  repo = mirror_part[dunder_pos + 2:]
-  if not owner or not repo:
-    return None
-  return owner, repo
+# A Forgejo repo full_name is exactly "owner/name". Validate shape before it flows into a
+# token-authed API path (attacker-controlled on unauthenticated webhooks): two segments,
+# safe chars, and no '.'/'..' traversal segments.
+def _is_valid_full_name(full_name: str) -> bool:
+  parts = full_name.split('/')
+  if len(parts) != 2:
+    return False
+  return all(p and p not in ('.', '..') and _FULL_NAME_SEG_RE.match(p) for p in parts)
 
 
 # ---------------------------------------------------------------------------
@@ -84,9 +67,7 @@ def _parse_mirror_full_name(full_name: str) -> tuple[str, str] | None:
 
 def _register_webhook_for_hook(cfg: ProxyConfig, hook: HookConfig):
   _require_init()
-  owner = hook.owner()
-  repo = hook.repo()
-  mirror = _mirror_name(owner, repo)
+  mirror = hook.source_repo().mirror_name()
   webhook_url = _PROXY_WEBHOOK_URL.format(port=_listen_port)
 
   # Check if mirror exists
@@ -133,7 +114,7 @@ def _register_all_webhooks(cfg: ProxyConfig):
     try:
       _register_webhook_for_hook(cfg, hook)
     except Exception as e:
-      log.error(f"error registering webhook for {hook.source_repo}: {e}")
+      log.error(f"error registering webhook for {hook.source}: {e}")
 
 
 def register_all_webhooks_async(cfg: ProxyConfig):
@@ -158,19 +139,22 @@ def _validate_signature(body: bytes, signature_header: str, secret: str) -> bool
 # Forgejo tag dereference
 # ---------------------------------------------------------------------------
 
-def _resolve_commit_sha(mirror: str, tag_sha: str) -> str:
+def _resolve_commit_sha(full_name: str, tag_sha: str) -> str:
   """
   Dereference an annotated tag SHA to the underlying commit SHA.
   If the SHA is already a commit (lightweight tag), returns it unchanged.
+
+  `full_name` is the mirror's authoritative `owner/name` from the webhook payload
+  (e.g. "gitadmin/github-com-Centimo-simd-1a2b3c4d").
   """
   _require_init()
-  status, data = _forgejo_api("GET", f"/repos/{_forgejo_user}/{mirror}/git/tags/{tag_sha}")
+  status, data = _forgejo_api("GET", f"/repos/{full_name}/git/tags/{tag_sha}")
   if status == 200 and isinstance(data, dict):
     obj = data.get('object', {})
     if isinstance(obj, dict) and obj.get('sha'):
       return obj['sha']
   if status != 404:
-    log.warning(f"git/tags API returned {status} for {mirror}/{tag_sha}, using original SHA")
+    log.warning(f"git/tags API returned {status} for {full_name}/{tag_sha}, using original SHA")
   # Lightweight tag (404) or API error — use the original SHA
   return tag_sha
 
@@ -202,26 +186,43 @@ def handle_forgejo_webhook(body: bytes, headers, cfg: ProxyConfig) -> tuple[int,
   if not isinstance(event, dict):
     return 400, "payload is not a JSON object"
 
-  ref = event.get('ref', '')
-  if not ref.startswith('refs/tags/'):
+  ref = event.get('ref')
+  if not isinstance(ref, str) or not ref.startswith('refs/tags/'):
     return 200, "not a tag push, ignored"
 
   tag = ref[len('refs/tags/'):]
 
+  # Recover the upstream source from the mirror's original_url (set from clone_addr at
+  # migration time; Forgejo serializes it in the webhook's repository object).
   repo_obj = event.get('repository')
-  full_name = repo_obj.get('full_name', '') if isinstance(repo_obj, dict) else ''
-  parsed = _parse_mirror_full_name(full_name)
-  if parsed is None:
-    log.warning(f"cannot parse mirror full_name: {full_name!r}")
-    return 200, "unrecognized repository name format, ignored"
+  if not isinstance(repo_obj, dict):
+    return 200, "unrecognized repository payload, ignored"
+  full_name = repo_obj.get('full_name', '') or ''
+  original_url = repo_obj.get('original_url', '') or ''
+  if not original_url and _is_valid_full_name(full_name):
+    # Payload didn't carry original_url — fall back to a direct repo fetch. full_name is
+    # attacker-controlled when no webhook_secret is set, so validate its shape (two safe
+    # segments, no traversal) before it flows into the token-authed Forgejo API path.
+    status, data = _forgejo_api("GET", f"/repos/{full_name}")
+    if status == 200 and isinstance(data, dict):
+      original_url = data.get('original_url', '') or ''
+  if not original_url:
+    log.warning(f"no original_url for mirror {full_name!r}")
+    return 200, "unrecognized repository (no original_url), ignored"
 
-  owner, repo = parsed
-  source_repo = f"{owner}/{repo}"
+  src = source.REGISTRY.parse_original_url(original_url)
+  if src is None:
+    log.warning(f"original_url not from an allowlisted source: {original_url!r}")
+    return 200, "unrecognized source, ignored"
+
+  # From here on use the authoritative mirror name derived from the validated source, never
+  # the raw payload full_name — Forgejo names this proxy's mirrors exactly {user}/{mirror_name}.
+  mirror_full_name = f"{_forgejo_user}/{src.mirror_name()}"
 
   # Find matching hook
-  hook = next((h for h in cfg.hooks if h.source_repo == source_repo), None)
+  hook = next((h for h in cfg.hooks if h.source_repo().key() == src.key()), None)
   if hook is None:
-    return 200, f"no hook configured for {source_repo}, ignored"
+    return 200, f"no hook configured for {src.key()}, ignored"
 
   version = hook.match_tag(tag)
   if version is None:
@@ -234,10 +235,9 @@ def handle_forgejo_webhook(body: bytes, headers, cfg: ProxyConfig) -> tuple[int,
   if not isinstance(tag_sha, str) or not _SHA_RE.match(tag_sha) or set(tag_sha) == {'0'}:
     return 400, "missing or invalid 'after' SHA in payload"
 
-  mirror = _mirror_name(owner, repo)
-  commit_sha = _resolve_commit_sha(mirror, tag_sha)
+  commit_sha = _resolve_commit_sha(mirror_full_name, tag_sha)
 
-  log.info(f"tag {tag} on {source_repo} matched, version={version}, commit={commit_sha}")
+  log.info(f"tag {tag} on {src.key()} matched, version={version}, commit={commit_sha}")
 
   t = threading.Thread(
     target=_run_command_safe,
@@ -257,7 +257,7 @@ def _run_command_safe(hook: HookConfig, tag: str, version: str, commit_sha: str)
   try:
     _run_command(hook, tag, version, commit_sha)
   except Exception as e:
-    log.error(f"hook command errored for {hook.source_repo} {version}: {e}")
+    log.error(f"hook command errored for {hook.source} {version}: {e}")
 
 
 def _run_command(hook: HookConfig, tag: str, version: str, commit_sha: str):
@@ -269,14 +269,16 @@ def _run_command(hook: HookConfig, tag: str, version: str, commit_sha: str):
   in a fresh temporary working directory (also exported as GIT_PROXY_WORKDIR),
   which is removed afterwards.
   """
-  mirror = _mirror_name(hook.owner(), hook.repo())
+  src = hook.source_repo()
 
   env = os.environ.copy()
   env.update(hook.env)
   env.update({
-    "GIT_PROXY_SOURCE_REPO": hook.source_repo,
+    # host/path canonical key (e.g. "github.com/Centimo/simd"); name kept for script compat.
+    "GIT_PROXY_SOURCE_REPO": src.key(),
+    "GIT_PROXY_SOURCE_HOST": src.host,
     "GIT_PROXY_SOURCE_URL": hook.source_url(),
-    "GIT_PROXY_MIRROR": f"{_forgejo_user}/{mirror}",
+    "GIT_PROXY_MIRROR": f"{_forgejo_user}/{src.mirror_name()}",
     "GIT_PROXY_TAG": tag,
     "GIT_PROXY_VERSION": version,
     "GIT_PROXY_COMMIT_SHA": commit_sha,
@@ -307,7 +309,7 @@ def _run_command(hook: HookConfig, tag: str, version: str, commit_sha: str):
       proc.communicate()
       log.error(
         "hook command timed out",
-        extra={"repo": hook.source_repo, "version": version, "timeout": hook.timeout},
+        extra={"repo": hook.source, "version": version, "timeout": hook.timeout},
       )
       return
 
@@ -315,12 +317,12 @@ def _run_command(hook: HookConfig, tag: str, version: str, commit_sha: str):
       log.error(
         "hook command failed",
         extra={
-          "repo": hook.source_repo, "version": version,
+          "repo": hook.source, "version": version,
           "returncode": proc.returncode,
           "stderr": (stderr or "").strip()[:500],
         },
       )
     else:
-      log.info("hook command succeeded", extra={"repo": hook.source_repo, "version": version})
+      log.info("hook command succeeded", extra={"repo": hook.source, "version": version})
   finally:
     shutil.rmtree(tmpdir, ignore_errors=True)

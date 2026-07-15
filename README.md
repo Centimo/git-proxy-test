@@ -1,35 +1,43 @@
 # git-proxy
 
-HTTP-прокси перед Forgejo, который **по требованию** зеркалирует GitHub-репозитории и
-на каждый `git clone`/`fetch` гарантирует их свежесть. Плюс webhook-механизм, который на
-пуш релизного тега в зеркало запускает произвольную внешнюю команду — сам прокси не знает
-ни про conan, ни про какую-либо конкретную цель.
+HTTP-прокси перед Forgejo, который **по требованию** зеркалирует публичные git-репозитории
+**любых** allowlist-хостов (github.com, gitlab.com, self-hosted GitLab и т.п.) и на каждый
+`git clone`/`fetch` гарантирует их свежесть. Плюс webhook-механизм, который на пуш релизного
+тега в зеркало запускает произвольную внешнюю команду — сам прокси не знает ни про conan, ни
+про какую-либо конкретную цель.
 
 ## Зачем
 
-Ускорить и сделать надёжнее CI-сборки, которым нужно клонировать репозитории с GitHub.
-В частности — для корректного RREV в `conan graph build-order` + lockfile-подходе, где
-клонируются репозитории с `export_sources()` (protobuf, Simd, onnxruntime и т.п.).
+Ускорить и сделать надёжнее CI-сборки, которым нужно клонировать репозитории с внешних
+git-хостов. В частности — для корректного RREV в `conan graph build-order` + lockfile-подходе,
+где клонируются репозитории с `export_sources()` (protobuf, Simd, onnxruntime и т.п.).
 
-CI обращается к прокси вместо GitHub. Прокси держит локальные зеркала в Forgejo,
-поэтому клоны идут из локальной сети, а не с github.com.
+CI обращается к прокси вместо исходного хоста. Прокси держит локальные зеркала в Forgejo,
+поэтому клоны идут из локальной сети, а не с внешнего хоста.
 
 ## Как это работает
 
-Клиент подменяет github.com на адрес прокси:
+Хост источника кодируется **первым сегментом пути**. Клиент подменяет каждый исходный хост
+на адрес прокси с этим хостом в префиксе (по одной `insteadOf`-паре на хост):
 
 ```bash
-git config --global url."http://<proxy-host>:8080/".insteadOf "https://github.com/"
+git config --global url."http://<proxy-host>:8080/github.com/".insteadOf "https://github.com/"
+git config --global url."http://<proxy-host>:8080/gitlab.com/".insteadOf "https://gitlab.com/"
 ```
 
-После этого `git clone https://github.com/owner/repo` фактически идёт на
-`http://<proxy-host>:8080/owner/repo`, и прокси обрабатывает запрос так:
+После этого `git clone https://gitlab.com/group/sub/repo` фактически идёт на
+`http://<proxy-host>:8080/gitlab.com/group/sub/repo`. Первый сегмент пути — хост источника
+(должен быть в allowlist `PROXY_SOURCES`), остаток — путь репозитория **любой глубины**
+(включая GitLab-подгруппы). Прокси обрабатывает запрос так:
 
 | Состояние зеркала в Forgejo         | Действие прокси                                              |
 |-------------------------------------|-------------------------------------------------------------|
 | Не существует                       | Создаёт зеркало (Forgejo API `POST /repos/migrate`), возвращает git-`ERR` → клиент повторяет запрос |
 | Существует, но пустое (`empty:true`) | Запускает `mirror-sync`, ждёт заполнения; пока не готово — git-`ERR` (клиент повторяет) |
 | Существует и заполнено              | Проксирует запрос в Forgejo; клиент получает данные          |
+
+Push (`POST .../git-receive-pack`) отклоняется с `403` — зеркала read-only. Запрос на хост
+вне `PROXY_SOURCES` (или с недопустимым сегментом пути) — `400`, зеркало не создаётся.
 
 ### Проверка свежести (freshness)
 
@@ -40,8 +48,8 @@ git config --global url."http://<proxy-host>:8080/".insteadOf "https://github.co
 
 Срабатывает на двух типах запросов — оба входят в любой `clone`/`fetch`:
 
-- `GET /owner/repo/info/refs?service=git-upload-pack` — анонс ссылок (refs) в начале операции.
-- `POST /owner/repo/git-upload-pack` — сама передача объектов, где клиент указывает `want <sha>`,
+- `GET /<host>/<path>/info/refs?service=git-upload-pack` — анонс ссылок (refs) в начале операции.
+- `POST /<host>/<path>/git-upload-pack` — сама передача объектов, где клиент указывает `want <sha>`,
   в том числе произвольный commit SHA, а не только конец ветки.
 
 Логика `ensure_synced`:
@@ -75,27 +83,43 @@ git config --global url."http://<proxy-host>:8080/".insteadOf "https://github.co
 
 ### Схема имён зеркал
 
-Зеркало в Forgejo называется `owner__repo` (двойное подчёркивание), владелец — админ Forgejo
-(`gitadmin` на проде). Пример: `github.com/Centimo/onnxruntime` → `gitadmin/Centimo__onnxruntime`.
+Имя зеркала в Forgejo — детерминированный **слаг + короткий хеш** от канонического ключа
+`host/path`: `slug = re.sub('[^A-Za-z0-9]+','-', "host/path")` (усечённый до 88 символов) плюс
+`-{8 hex}` от `sha256(host/path)`. Владелец — админ Forgejo (`gitadmin` на проде). Пример:
+`github.com/Centimo/simd` → `gitadmin/github-com-Centimo-simd-0c2b132c`.
 
-> Ограничение: если `owner` или `repo` сами содержат `__`, обратный разбор имени
-> (`hooks.py:_parse_mirror_full_name`) неоднозначен. Известное ограничение схемы-делимитера.
+Хеш-суффикс делает имя коллизионно-безопасным по хосту и вложенности (`github.com/a/b`,
+`gitlab.com/a/b`, `github.com/a/b/c` дают разные имена) и структурно исключает forbidden-имена
+Forgejo (`.`/`..`, хвосты `.git`/`.wiki`/… — точки заменены на `-`). Длина ограничена ~97 символами.
+
+Обратное сопоставление зеркало → источник **не** делается разбором имени: источник берётся из
+поля `original_url` репозитория (Forgejo заполняет его из `clone_addr` при миграции и сериализует
+как в `GET /repos/{user}/{name}`, так и внутри payload вебхука). См. `proxy/source.py`.
 
 ## Интеграция с GitLab CI
 
-Задача — чтобы `git clone https://github.com/...` из джоб (и клон сабмодулей, указывающих на
-github.com) уходил на прокси. Подмену задаёт git-опция `url.<base>.insteadOf`. Удобнее всего
-пробрасывать её **через переменные окружения** `GIT_CONFIG_COUNT/KEY_0/VALUE_0` — git читает их
-глобально, поэтому подмена действует и на фазу `get_sources`, и на инициализацию сабмодулей
-(до `before_script`), а не только на явные `git clone` в скрипте. Требуется git ≥ 2.31 на раннере.
+Задача — чтобы `git clone https://github.com/...` / `https://gitlab.com/...` из джоб (и клон
+сабмодулей, указывающих на эти хосты) уходил на прокси. Подмену задаёт git-опция
+`url.<base>.insteadOf`. Так как хост кодируется в путь, **на каждый хост-источник нужна своя
+пара** `insteadOf`. Удобнее всего пробрасывать их **через переменные окружения**
+`GIT_CONFIG_COUNT/KEY_i/VALUE_i` — git читает их глобально, поэтому подмена действует и на фазу
+`get_sources`, и на инициализацию сабмодулей (до `before_script`), а не только на явные
+`git clone` в скрипте. Требуется git ≥ 2.31 на раннере.
 
-Значения переменных (общие для всех вариантов ниже):
+Значения переменных (общие для всех вариантов ниже; здесь github.com + gitlab.com):
 
 ```
-GIT_CONFIG_COUNT=1
-GIT_CONFIG_KEY_0=url.http://<proxy-host>:8080/.insteadOf
+GIT_CONFIG_COUNT=2
+GIT_CONFIG_KEY_0=url.http://<proxy-host>:8080/github.com/.insteadOf
 GIT_CONFIG_VALUE_0=https://github.com/
+GIT_CONFIG_KEY_1=url.http://<proxy-host>:8080/gitlab.com/.insteadOf
+GIT_CONFIG_VALUE_1=https://gitlab.com/
 ```
+
+> **Важно про сабмодули.** Если сабмодуль ссылается на хост, которого нет в `PROXY_SOURCES`
+> (и в `insteadOf` выше), возможны два исхода: если его `insteadOf` не переписал — клон идёт
+> напрямую; если переписал — прокси вернёт `400` и клон упадёт. Перечислите в `PROXY_SOURCES`
+> и в `insteadOf` **все** хосты, на которые ссылаются сабмодули CI.
 
 ### На весь раннер (`config.toml`)
 
@@ -105,22 +129,15 @@ GIT_CONFIG_VALUE_0=https://github.com/
 [[runners]]
   [runners.docker]
     environment = [
-      "GIT_CONFIG_COUNT=1",
-      "GIT_CONFIG_KEY_0=url.http://<proxy-host>:8080/.insteadOf",
+      "GIT_CONFIG_COUNT=2",
+      "GIT_CONFIG_KEY_0=url.http://<proxy-host>:8080/github.com/.insteadOf",
       "GIT_CONFIG_VALUE_0=https://github.com/",
+      "GIT_CONFIG_KEY_1=url.http://<proxy-host>:8080/gitlab.com/.insteadOf",
+      "GIT_CONFIG_VALUE_1=https://gitlab.com/",
     ]
 ```
 
-Для shell-executor'а — тот же список, но на уровне самого `[[runners]]`:
-
-```toml
-[[runners]]
-  environment = [
-    "GIT_CONFIG_COUNT=1",
-    "GIT_CONFIG_KEY_0=url.http://<proxy-host>:8080/.insteadOf",
-    "GIT_CONFIG_VALUE_0=https://github.com/",
-  ]
-```
+Для shell-executor'а — тот же список, но на уровне самого `[[runners]]`.
 
 ### На один проект (`.gitlab-ci.yml`)
 
@@ -128,9 +145,11 @@ GIT_CONFIG_VALUE_0=https://github.com/
 
 ```yaml
 variables:
-  GIT_CONFIG_COUNT: "1"
-  GIT_CONFIG_KEY_0: "url.http://<proxy-host>:8080/.insteadOf"
+  GIT_CONFIG_COUNT: "2"
+  GIT_CONFIG_KEY_0: "url.http://<proxy-host>:8080/github.com/.insteadOf"
   GIT_CONFIG_VALUE_0: "https://github.com/"
+  GIT_CONFIG_KEY_1: "url.http://<proxy-host>:8080/gitlab.com/.insteadOf"
+  GIT_CONFIG_VALUE_1: "https://gitlab.com/"
 ```
 
 ### Вложенные контейнеры (`docker run` внутри джобы)
@@ -138,17 +157,19 @@ variables:
 Если джоба сама запускает контейнеры (сборка внутри `docker run`, DinD), переменные
 `GIT_CONFIG_*` из окружения джобы **не попадают** в эти вложенные контейнеры автоматически.
 На этот случай в репозитории есть `docker-wrapper.sh` — он подменяет `docker` в PATH и на каждый
-`docker run` заново прокидывает `-e GIT_CONFIG_COUNT -e GIT_CONFIG_KEY_0 -e GIT_CONFIG_VALUE_0`
-(поддерживает одну git-config пару, индекс `_0`; падает с ошибкой при конфликте, если переменная
-уже передана вручную). Установка на хост раннера — `install-docker-wrapper.sh` (кладёт враппер в
-`/usr/local/bin/docker`).
+`docker run` заново прокидывает `-e GIT_CONFIG_COUNT` и по паре `-e GIT_CONFIG_KEY_i
+-e GIT_CONFIG_VALUE_i` на каждый индекс `0..GIT_CONFIG_COUNT-1` (падает с ошибкой при конфликте,
+если переменная уже передана вручную). Установка на хост раннера — `install-docker-wrapper.sh`
+(кладёт враппер в `/usr/local/bin/docker`).
 
 ### Хост раннера напрямую
 
-Для клонов вне CI (или как запасной вариант для shell-раннера) — системный git-config хоста:
+Для клонов вне CI (или как запасной вариант для shell-раннера) — системный git-config хоста
+(по паре на хост):
 
 ```bash
-sudo git config --system url."http://<proxy-host>:8080/".insteadOf "https://github.com/"
+sudo git config --system url."http://<proxy-host>:8080/github.com/".insteadOf "https://github.com/"
+sudo git config --system url."http://<proxy-host>:8080/gitlab.com/".insteadOf "https://gitlab.com/"
 ```
 
 ## Webhook → внешняя команда
@@ -172,9 +193,10 @@ fallback `X-Forgejo-Signature`), если он задан.
 
 | Переменная               | Значение                                                    |
 |--------------------------|-------------------------------------------------------------|
-| `GIT_PROXY_SOURCE_REPO`  | `owner/repo` на GitHub (например `Centimo/simd`)            |
-| `GIT_PROXY_SOURCE_URL`   | `https://github.com/owner/repo.git`                         |
-| `GIT_PROXY_MIRROR`       | Полное имя зеркала в Forgejo (`gitadmin/owner__repo`)       |
+| `GIT_PROXY_SOURCE_REPO`  | Канонический ключ `host/path` (например `github.com/Centimo/simd`) |
+| `GIT_PROXY_SOURCE_HOST`  | Хост источника (например `github.com`)                      |
+| `GIT_PROXY_SOURCE_URL`   | Clone-URL источника (`https://github.com/Centimo/simd.git`) |
+| `GIT_PROXY_MIRROR`       | Полное имя зеркала в Forgejo (`gitadmin/<слаг>-<8hex>`)      |
 | `GIT_PROXY_TAG`          | Исходный тег (`v1.2.3`)                                      |
 | `GIT_PROXY_VERSION`      | Версия из тега по `tag_pattern` (`1.2.3`)                   |
 | `GIT_PROXY_COMMIT_SHA`   | Commit-SHA, на который указывает тег (разыменованный)       |
@@ -193,6 +215,7 @@ forgejo/
   entrypoint.sh        — стартует Forgejo, создаёт admin + API-токен, затем запускает proxy.py
 proxy/
   proxy.py             — HTTP-прокси, проверка свежести зеркал, git smart-HTTP проксирование
+  source.py            — модель источника: allowlist хостов, разбор путей, имена зеркал
   config.py            — загрузка hooks.yml (dataclass HookConfig / ProxyConfig)
   hooks.py             — webhook-обработчик + запуск внешней команды хука
   Dockerfile           — отдельный образ только proxy (см. «Известные расхождения»)
@@ -224,6 +247,7 @@ Docker-bridge. Без host-режима Forgejo не достучится до g
 | `PROXY_CONFIG`            | Путь к hooks.yml внутри контейнера (по умолчанию `/config/hooks.yml`) |
 | `PROXY_SYNC_MODE`         | Режим синхронизации зеркала: `wait` (ждать завершения, по умолчанию) или `async` (отдать зеркало сразу) |
 | `PROXY_SYNC_TTL`          | Сколько секунд после успешной синхронизации зеркало считается свежим (по умолчанию `30`) |
+| `PROXY_SOURCES`           | Allowlist хостов-источников через запятую; элемент `host` или `host=<baseURL>` (по умолчанию `github.com`) |
 
 Прокси дополнительно читает `FORGEJO_URL`, `FORGEJO_TOKEN`, `FORGEJO_USER`,
 `FORGEJO_PASSWORD` — их проставляет `entrypoint.sh`.
@@ -242,7 +266,7 @@ Docker-bridge. Без host-режима Forgejo не достучится до g
 ```yaml
 webhook_secret: ${WEBHOOK_SECRET}    # опционально; включает проверку HMAC-подписи
 hooks:
-  - source_repo: Centimo/simd        # owner/repo на GitHub (обязательно)
+  - source: github.com/Centimo/simd  # host/path источника, любой глубины (обязательно; хост ∈ PROXY_SOURCES)
     tag_pattern: "v{version}"         # {version} → SemVer-regex (обязательно)
     command: /config/hooks/on-release.sh   # что запустить на совпавший тег (обязательно)
     timeout: 300                      # секунд до убийства команды (опц., по умолчанию 300)
@@ -275,10 +299,11 @@ docker compose up -d --build
 
 ## Тесты
 
-Юнит-тесты (`tests/`, pytest) покрывают чистую логику без сети и Forgejo: разбор конфига и
-SemVer-паттернов (`config.py`), синхронизацию по требованию (`ensure_synced`) / валидацию имён
-(`proxy.py`), разбор имён зеркал / валидацию webhook-подписи / обработчик webhook (`hooks.py`).
-Все внешние вызовы (git, Forgejo API) замоканы.
+Юнит-тесты (`tests/`, pytest) покрывают чистую логику без сети и Forgejo: имена зеркал /
+разбор путей и `host/path`-источников / allowlist (`source.py`), разбор конфига и
+SemVer-паттернов (`config.py`), синхронизацию по требованию (`ensure_synced`) / оркестрацию
+запросов (`proxy.py`), восстановление источника из `original_url` / валидацию webhook-подписи /
+обработчик webhook (`hooks.py`). Все внешние вызовы (git, Forgejo API) замоканы.
 
 ```bash
 python3 -m pytest tests/ -v
@@ -289,11 +314,12 @@ python3 -m pytest tests/ -v
 
 ## Принудительное обновление зеркала вручную
 
-На старом образе (без проверки свежести) или для немедленной синхронизации:
+Имя зеркала (`<слаг>-<8hex>`) можно найти в Forgejo UI или через API. Для немедленной
+синхронизации:
 
 ```bash
 curl -s -X POST -u <admin>:<pass> \
-  "http://<proxy-host>:3000/api/v1/repos/gitadmin/<owner>__<repo>/mirror-sync"
+  "http://<proxy-host>:3000/api/v1/repos/gitadmin/<mirror-name>/mirror-sync"
 ```
 
 `mirror-sync` возвращает `200/202` сразу — сама синхронизация идёт в фоне.
@@ -301,7 +327,7 @@ curl -s -X POST -u <admin>:<pass> \
 
 ```bash
 curl -s -u <admin>:<pass> \
-  "http://<proxy-host>:3000/api/v1/repos/gitadmin/<owner>__<repo>/branches/<branch>" | jq -r '.commit.id'
+  "http://<proxy-host>:3000/api/v1/repos/gitadmin/<mirror-name>/branches/<branch>" | jq -r '.commit.id'
 ```
 
 ## Выбор Forgejo vs Gitea

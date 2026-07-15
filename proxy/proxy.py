@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
-git-proxy: HTTP proxy that mirrors GitHub repositories into Forgejo on demand.
+git-proxy: HTTP proxy that mirrors public git repositories into Forgejo on demand.
 
-Client configures:
-  git config --global url."http://<proxy-host>:8080/".insteadOf "https://github.com/"
+Any allowlisted upstream host (github.com, gitlab.com, self-hosted GitLab, ...) is
+supported; the host is encoded as the first path segment. Client configures one
+`insteadOf` per host:
+  git config url."http://<proxy-host>:8080/github.com/".insteadOf "https://github.com/"
+  git config url."http://<proxy-host>:8080/gitlab.com/".insteadOf "https://gitlab.com/"
 
-Then `git clone https://github.com/owner/repo` becomes
-     `git clone http://<proxy-host>:8080/owner/repo`
+Then `git clone https://gitlab.com/group/sub/repo` becomes
+     `git clone http://<proxy-host>:8080/gitlab.com/group/sub/repo`
 
 Proxy behaviour:
   - Mirror exists and is synced  → proxy the request to Forgejo
   - Mirror exists but empty      → return git ERR (retry)
   - Mirror does not exist        → create mirror, return git ERR (retry)
+  - POST /git-receive-pack       → 403 (mirrors are read-only)
 """
 
 import base64
 import logging
 import os
-import re
 import shlex
 import threading
 import time
@@ -31,12 +34,13 @@ from socketserver import ThreadingMixIn
 
 from config import load_config
 import hooks as _hooks
+import source
+from source import SourceRepo, parse_request_path
 
 FORGEJO_URL = os.environ.get("FORGEJO_URL", "http://127.0.0.1:3000")
 FORGEJO_TOKEN = os.environ.get("FORGEJO_TOKEN", "")
 FORGEJO_USER = os.environ.get("FORGEJO_USER", "gitadmin")
 FORGEJO_PASSWORD = os.environ.get("FORGEJO_PASSWORD", "")
-GITHUB_BASE = "https://github.com"
 LISTEN_PORT = int(os.environ.get("PROXY_PORT", "8080"))
 FORGEJO_API_TIMEOUT = 30
 FORGEJO_MIGRATE_TIMEOUT = 1800  # large repos can take time
@@ -46,8 +50,6 @@ SYNC_FRESHNESS_TTL = int(os.environ.get("PROXY_SYNC_TTL", "30"))  # seconds a mi
 SYNC_WAIT_TIMEOUT = 120  # how long to wait (mode=wait) for mirror-sync to complete, polling mirror_updated
 SYNC_CACHE_MAX = 1000  # cap on number of repos tracked in the freshness cache to prevent unbounded growth
 
-# Allowed characters in GitHub owner/repo names
-_NAME_RE = re.compile(r'^[A-Za-z0-9_.-]{1,100}$')
 
 class _StructuredFormatter(logging.Formatter):
   """Appends `extra=` kwargs as ` key=value` pairs after the message for easy grep/parsing."""
@@ -115,38 +117,33 @@ def forgejo_api(method: str, path: str, body: dict | None = None, timeout: int =
       return e.code, {}
 
 
-# Mirror repo name in Forgejo encodes both owner and repo to avoid collisions.
-def mirror_name(owner: str, repo: str) -> str:
-  return f"{owner}__{repo}"
-
-
-def get_mirror(owner: str, repo: str) -> dict | None:
-  name = mirror_name(owner, repo)
+def get_mirror(source_repo: SourceRepo) -> dict | None:
+  name = source_repo.mirror_name()
   status, data = forgejo_api("GET", f"/repos/{FORGEJO_USER}/{name}")
   if status == 200:
     return data
   return None
 
 
-def _do_migrate(owner: str, repo: str):
-  clone_addr = f"{GITHUB_BASE}/{owner}/{repo}.git"
-  name = mirror_name(owner, repo)
+def _do_migrate(source_repo: SourceRepo):
+  clone_addr = source.REGISTRY.clone_addr(source_repo)
+  name = source_repo.mirror_name()
+  key = source_repo.key()
   status, data = forgejo_api("POST", "/repos/migrate", {
     "clone_addr": clone_addr,
     "repo_name": name,
-    "description": f"Mirror of github.com/{owner}/{repo}",
+    "description": f"Mirror of {source.REGISTRY.source_url(source_repo)}",
     "mirror": True,
     "private": False,
     "uid": 1,
   }, timeout=FORGEJO_MIGRATE_TIMEOUT)
-  key = f"{owner}/{repo}"
   if status not in (201, 409):
     log.warning("migrate failed", extra={"repo": key, "status": status, "body": str(data)[:200]})
     return
   log.info("migrate done", extra={"repo": key, "status": status})
   # Register webhook after mirror is created, if a hook config exists for this repo
   if _proxy_config is not None:
-    hook = next((h for h in _proxy_config.hooks if h.source_repo == key), None)
+    hook = next((h for h in _proxy_config.hooks if h.source_repo().key() == key), None)
     if hook is not None:
       try:
         _hooks._register_webhook_for_hook(_proxy_config, hook)
@@ -154,8 +151,8 @@ def _do_migrate(owner: str, repo: str):
         log.error("webhook registration failed after migrate", extra={"repo": key, "error": str(e)})
 
 
-def create_mirror(owner: str, repo: str):
-  t = threading.Thread(target=_do_migrate, args=(owner, repo), daemon=True)
+def create_mirror(source_repo: SourceRepo):
+  t = threading.Thread(target=_do_migrate, args=(source_repo,), daemon=True)
   t.start()
 
 
@@ -202,24 +199,24 @@ class MirrorFreshness:
       while len(self._last_sync) > self._cache_max:
         self._last_sync.popitem(last=False)
 
-  def _get_mirror_updated(self, owner: str, repo: str, timeout: float = FORGEJO_API_TIMEOUT) -> tuple[bool, str | None]:
+  def _get_mirror_updated(self, source_repo: SourceRepo, timeout: float = FORGEJO_API_TIMEOUT) -> tuple[bool, str | None]:
     """Returns (ok, value): ok=False means the API call itself failed (exception / non-200) —
     the caller cannot trust `value` at all in that case. ok=True means the request succeeded;
     `value` is the `mirror_updated` field, which may legitimately be None/empty (mirror never
     synced yet) — that is NOT an error and must not be conflated with an API failure.
     `timeout` bounds the underlying HTTP call so the poll loop can honor its own deadline."""
-    name = mirror_name(owner, repo)
+    name = source_repo.mirror_name()
     try:
       status, data = forgejo_api("GET", f"/repos/{self._forgejo_user}/{name}", timeout=timeout)
     except Exception as e:
-      log.error("get mirror_updated exception", extra={"repo": f"{owner}/{repo}", "error": str(e)})
+      log.error("get mirror_updated exception", extra={"repo": source_repo.key(), "error": str(e)})
       return False, None
     if status != 200:
-      log.error("get mirror_updated failed", extra={"repo": f"{owner}/{repo}", "status": status})
+      log.error("get mirror_updated failed", extra={"repo": source_repo.key(), "status": status})
       return False, None
     return True, data.get("mirror_updated")
 
-  def ensure_synced(self, owner: str, repo: str) -> bool:
+  def ensure_synced(self, source_repo: SourceRepo) -> bool:
     """Ensures the Forgejo mirror is synced with GitHub, sync-on-demand with a freshness cache.
 
     - If the mirror was synced successfully within freshness_ttl seconds, returns True immediately.
@@ -230,7 +227,7 @@ class MirrorFreshness:
                       waiting — the caller serves whatever the mirror currently has.
     Fail-open: never raises; any API/network error or timeout is logged and returns False,
     the caller proxies regardless."""
-    key = f"{owner}/{repo}"
+    key = source_repo.key()
 
     if self._is_fresh(key):
       return True
@@ -257,7 +254,7 @@ class MirrorFreshness:
       # ensure_synced itself returns immediately without waiting, so the caller serves
       # whatever the mirror currently has — but the mirror is only ever marked fresh once
       # the background sync has genuinely completed, never optimistically.
-      t = threading.Thread(target=self._run_sync_async_bg, args=(owner, repo, key, inflight), daemon=True)
+      t = threading.Thread(target=self._run_sync_async_bg, args=(source_repo, key, inflight), daemon=True)
       try:
         t.start()
       except Exception as e:
@@ -273,7 +270,7 @@ class MirrorFreshness:
 
     try:
       try:
-        return self._run_sync_wait(owner, repo, key)
+        return self._run_sync_wait(source_repo, key)
       except Exception as e:
         # Belt-and-braces: _run_sync_wait already guards its own forgejo_api calls, but this
         # outer catch makes the "never raises" contract structural rather than incidental
@@ -285,40 +282,40 @@ class MirrorFreshness:
         self._ensure_inflight.pop(key, None)
       inflight.set()
 
-  def _run_sync_wait(self, owner: str, repo: str, key: str) -> bool:
+  def _run_sync_wait(self, source_repo: SourceRepo, key: str) -> bool:
     """Leader path for sync_mode="wait": POST mirror-sync, then synchronously wait for it
     to actually complete (or time out), returning True/False accordingly. Wrapped by
     ensure_synced in a blanket try/except so an unexpected exception anywhere in here (not
     just around the forgejo_api calls) still honors the fail-open contract."""
-    ok, prev_updated = self._get_mirror_updated(owner, repo)
+    ok, prev_updated = self._get_mirror_updated(source_repo)
     if not ok:
       # Couldn't even get a pre-sync snapshot — fail open without a blind poll loop,
       # which would otherwise have no baseline to detect convergence against.
       log.error("mirror-sync aborted: could not fetch pre-sync mirror_updated", extra={"repo": key})
       return False
 
-    if not self._trigger_mirror_sync(owner, repo, key):
+    if not self._trigger_mirror_sync(source_repo, key):
       return False
 
-    if self._wait_for_sync_completion(owner, repo, key, prev_updated):
+    if self._wait_for_sync_completion(source_repo, key, prev_updated):
       self._mark_fresh(key)
       return True
     return False
 
-  def _run_sync_async_bg(self, owner: str, repo: str, key: str, inflight: threading.Event):
+  def _run_sync_async_bg(self, source_repo: SourceRepo, key: str, inflight: threading.Event):
     """Background thread body for sync_mode="async": POST mirror-sync, wait for it to
     actually complete (same criterion as "wait" mode), and only mark the mirror fresh if it
     genuinely converged — never optimistically. Always releases _ensure_inflight[key] and
     the inflight Event in `finally`, even on an unexpected exception, so the key never gets
     stuck and a later call (after this one finishes, successfully or not) can start fresh."""
     try:
-      ok, prev_updated = self._get_mirror_updated(owner, repo)
+      ok, prev_updated = self._get_mirror_updated(source_repo)
       if not ok:
         log.error("mirror-sync (async bg) aborted: could not fetch pre-sync mirror_updated", extra={"repo": key})
         return
-      if not self._trigger_mirror_sync(owner, repo, key):
+      if not self._trigger_mirror_sync(source_repo, key):
         return
-      if self._wait_for_sync_completion(owner, repo, key, prev_updated):
+      if self._wait_for_sync_completion(source_repo, key, prev_updated):
         self._mark_fresh(key)
     except Exception as e:
       log.error("mirror-sync (async bg) unexpected exception", extra={"repo": key, "error": str(e)})
@@ -327,9 +324,9 @@ class MirrorFreshness:
         self._ensure_inflight.pop(key, None)
       inflight.set()
 
-  def _trigger_mirror_sync(self, owner: str, repo: str, key: str) -> bool:
+  def _trigger_mirror_sync(self, source_repo: SourceRepo, key: str) -> bool:
     """POSTs /mirror-sync. Returns True on 200, False (logged) on any error/exception."""
-    name = mirror_name(owner, repo)
+    name = source_repo.mirror_name()
     try:
       status, data = forgejo_api("POST", f"/repos/{self._forgejo_user}/{name}/mirror-sync")
     except Exception as e:
@@ -341,7 +338,7 @@ class MirrorFreshness:
     log.info("mirror-sync triggered", extra={"repo": key, "sync_mode": self._sync_mode})
     return True
 
-  def _wait_for_sync_completion(self, owner: str, repo: str, key: str, prev_updated: str | None) -> bool:
+  def _wait_for_sync_completion(self, source_repo: SourceRepo, key: str, prev_updated: str | None) -> bool:
     """Polls mirror_updated until it transitions to a genuinely new, non-empty value (relative
     to prev_updated), or sync_wait_timeout elapses. Shared by the "wait" leader path and the
     "async" background thread — the completion criterion is identical either way; only who
@@ -359,7 +356,7 @@ class MirrorFreshness:
       remaining = deadline - time.monotonic()
       if remaining <= 0:
         break
-      ok, current_updated = self._get_mirror_updated(owner, repo, timeout=min(FORGEJO_API_TIMEOUT, remaining))
+      ok, current_updated = self._get_mirror_updated(source_repo, timeout=min(FORGEJO_API_TIMEOUT, remaining))
       if not ok:
         # Transient API error while polling — don't treat it as convergence, just keep
         # polling until the timeout.
@@ -376,22 +373,22 @@ class MirrorFreshness:
     })
     return False
 
-  def trigger_sync(self, owner: str, repo: str) -> bool:
+  def trigger_sync(self, source_repo: SourceRepo) -> bool:
     """Triggers Forgejo mirror-sync via API. Returns False if a sync is already in flight."""
-    key = f"{owner}/{repo}"
+    key = source_repo.key()
     with self._sync_lock:
       if key in self._sync_triggered:
         log.info("mirror-sync dedup: already in flight", extra={"repo": key})
         return False
       self._sync_triggered.add(key)
-    t = threading.Thread(target=self._do_sync, args=(owner, repo, key), daemon=True)
+    t = threading.Thread(target=self._do_sync, args=(source_repo, key), daemon=True)
     t.start()
     return True
 
-  def _do_sync(self, owner: str, repo: str, key: str):
+  def _do_sync(self, source_repo: SourceRepo, key: str):
     start = time.monotonic()
     try:
-      name = mirror_name(owner, repo)
+      name = source_repo.mirror_name()
       status, data = forgejo_api("POST", f"/repos/{self._forgejo_user}/{name}/mirror-sync")
       elapsed_ms = int((time.monotonic() - start) * 1000)
       if status == 200:
@@ -417,15 +414,14 @@ def git_error_body(message: str) -> bytes:
   )
 
 
-def _is_upload_pack_request(parts: list[str], command: str, path: str) -> bool:
+def _is_upload_pack_request(service: str, command: str, query: str) -> bool:
   """True for the two request shapes that need mirror freshness: the ref advertisement
   (GET .../info/refs?service=git-upload-pack) and the actual fetch (POST .../git-upload-pack,
   which carries `want <sha>` lines — including arbitrary commit SHAs, not just branch tips)."""
-  if command == "GET" and len(parts) == 4 and parts[2] == "info" and parts[3] == "refs":
-    query = path.split("?", 1)[1] if "?" in path else ""
-    service = urllib.parse.parse_qs(query).get("service", [""])[0]
-    return service == "git-upload-pack"
-  if command == "POST" and path.split("?")[0].endswith("/git-upload-pack"):
+  if command == "GET" and service == "/info/refs":
+    svc = urllib.parse.parse_qs(query).get("service", [""])[0]
+    return svc == "git-upload-pack"
+  if command == "POST" and service == "/git-upload-pack":
     return True
   return False
 
@@ -439,16 +435,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
   def log_message(self, format, *args):
     log.info("http access", extra={"client": self.client_address[0], "line": format % args})
 
-  def wait_for_mirror(self, owner: str, repo: str) -> dict | None:
+  def wait_for_mirror(self, source_repo: SourceRepo) -> dict | None:
     deadline = time.monotonic() + MIRROR_WAIT_TIMEOUT
     interval = 2
     while time.monotonic() < deadline:
       time.sleep(interval)
-      mirror = get_mirror(owner, repo)
+      mirror = get_mirror(source_repo)
       if mirror is not None and not mirror.get("empty", True):
-        log.info("mirror ready", extra={"repo": f"{owner}/{repo}"})
+        log.info("mirror ready", extra={"repo": source_repo.key()})
         return mirror
-    return get_mirror(owner, repo)
+    return get_mirror(source_repo)
 
   def send_git_error(self, message: str):
     log.info("returning git error to client", extra={"message": message})
@@ -470,15 +466,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
       self.end_headers()
       self.wfile.write(body)
 
-  def proxy_to_forgejo(self, owner: str, repo: str):
-    name = mirror_name(owner, repo)
-    # Strict prefix replacement to avoid corrupting the rest of the path
-    prefix = f"/{owner}/{repo}"
-    if not self.path.startswith(prefix):
-      self.send_response(400)
-      self.end_headers()
-      return
-    remainder = self.path[len(prefix):]
+  def proxy_to_forgejo(self, source_repo: SourceRepo, service: str):
+    name = source_repo.mirror_name()
+    # Reconstruct the Forgejo path from the parsed git service + original query string,
+    # rather than slicing a prefix off self.path (which would not survive a trailing
+    # ".git" on the source or a nested repo path).
+    query = self.path.split("?", 1)[1] if "?" in self.path else ""
+    remainder = service + ("?" + query if query else "")
     forgejo_path = f"/{FORGEJO_USER}/{name}{remainder}"
     forgejo_url = f"{FORGEJO_URL}{forgejo_path}"
 
@@ -552,49 +546,55 @@ class ProxyHandler(BaseHTTPRequestHandler):
       pass
 
   def handle_git_request(self):
-    # Parse and validate owner/repo from path
-    # Expected: /owner/repo/...  or  /owner/repo.git/...
+    # Parse and validate /<host>/<repo-path...>/<git-service> against the source allowlist.
     path_only = self.path.split("?")[0]
-    parts = path_only.lstrip("/").split("/")
-    if len(parts) < 2:
+    parsed = parse_request_path(path_only, source.REGISTRY)
+    if parsed is None:
+      log.warning("rejected invalid request path", extra={"path": self.path})
       self.send_response(400)
       self.end_headers()
       return
 
-    owner = parts[0]
-    repo = parts[1].removesuffix(".git")
+    source_repo, service = parsed
+    key = source_repo.key()
 
-    if not _NAME_RE.match(owner) or not _NAME_RE.match(repo):
-      log.warning("rejected invalid owner/repo", extra={"owner": repr(owner), "repo_name": repr(repo)})
-      self.send_response(400)
+    # Mirrors are read-only: reject pushes rather than proxying them upstream.
+    if self.command == "POST" and service == "/git-receive-pack":
+      log.warning("rejected push to read-only mirror", extra={"repo": key})
+      body = b"git-proxy mirrors are read-only"
+      self.send_response(403)
+      self.send_header("Content-Type", "text/plain")
+      self.send_header("Content-Length", str(len(body)))
       self.end_headers()
+      self.wfile.write(body)
       return
 
-    log.info("request received", extra={"repo": f"{owner}/{repo}", "method": self.command, "path": self.path})
+    log.info("request received", extra={"repo": key, "method": self.command, "path": self.path})
 
-    mirror = get_mirror(owner, repo)
+    mirror = get_mirror(source_repo)
     freshness: MirrorFreshness = self.server.freshness  # type: ignore[attr-defined]
 
     if mirror is None:
-      log.info("mirror create-on-demand", extra={"repo": f"{owner}/{repo}"})
-      create_mirror(owner, repo)
+      log.info("mirror create-on-demand", extra={"repo": key})
+      create_mirror(source_repo)
     elif mirror.get("empty", True):
-      log.info("mirror empty, triggering sync", extra={"repo": f"{owner}/{repo}"})
-      freshness.trigger_sync(owner, repo)
+      log.info("mirror empty, triggering sync", extra={"repo": key})
+      freshness.trigger_sync(source_repo)
 
     if mirror is None or mirror.get("empty", True):
-      log.info("waiting for mirror to populate", extra={"repo": f"{owner}/{repo}"})
-      mirror = self.wait_for_mirror(owner, repo)
+      log.info("waiting for mirror to populate", extra={"repo": key})
+      mirror = self.wait_for_mirror(source_repo)
 
     if mirror is None or mirror.get("empty", True):
       self.send_git_error("mirror is syncing, retry in a moment")
       return
 
-    if _is_upload_pack_request(parts, self.command, self.path):
-      synced = freshness.ensure_synced(owner, repo)
-      log.info("ensure_synced result", extra={"repo": f"{owner}/{repo}", "synced": synced})
+    query = self.path.split("?", 1)[1] if "?" in self.path else ""
+    if _is_upload_pack_request(service, self.command, query):
+      synced = freshness.ensure_synced(source_repo)
+      log.info("ensure_synced result", extra={"repo": key, "synced": synced})
 
-    self.proxy_to_forgejo(owner, repo)
+    self.proxy_to_forgejo(source_repo, service)
 
   def do_GET(self):
     self.handle_git_request()
@@ -639,6 +639,7 @@ if __name__ == "__main__":
 
   log.info("git-proxy starting", extra={
     "port": LISTEN_PORT, "forgejo_url": FORGEJO_URL, "forgejo_user": FORGEJO_USER, "sync_mode": SYNC_MODE,
+    "sources": ",".join(source.REGISTRY.hosts()),
   })
   server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), ProxyHandler)
   server.freshness = MirrorFreshness(

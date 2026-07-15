@@ -10,6 +10,9 @@ from dataclasses import dataclass, field
 
 import yaml
 
+import source
+from source import SourceRepo, parse_source_path
+
 log = logging.getLogger("git-proxy")
 
 _ENV_VAR_RE = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}')
@@ -23,17 +26,17 @@ def _expand_env(value: str) -> str:
 
 @dataclass
 class HookConfig:
-  source_repo: str        # "Centimo/simd" — owner/repo on GitHub
+  source: str             # "github.com/Centimo/simd" — host/path on the upstream (any depth)
   tag_pattern: str        # "v{version}" — {version} expands to a SemVer regex group
   command: list[str]      # argv passed to subprocess (already normalized, no shell involved)
   env: dict[str, str]     # extra environment variables exported to the command
   timeout: int            # seconds before the command is killed
   _tag_re: re.Pattern = field(init=False, repr=False, compare=False)
+  _source: SourceRepo = field(init=False, repr=False, compare=False)
 
   def __post_init__(self):
-    parts = self.source_repo.split('/')
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-      raise ValueError(f"source_repo must be 'owner/repo', got: {self.source_repo!r}")
+    # Validate host (allowlist, fail-fast) + path segments, and cache the parsed source.
+    self._source = parse_source_path(self.source, source.REGISTRY)
 
     # Convert tag_pattern like "v{version}" to regex "^v(?P<version>...)$"
     # Matches SemVer: X.Y.Z with optional pre-release (-alpha.1) and build (+001)
@@ -42,11 +45,8 @@ class HookConfig:
     pattern = escaped.replace(r'\{version\}', semver)
     self._tag_re = re.compile(f'^{pattern}$')
 
-  def owner(self) -> str:
-    return self.source_repo.split('/')[0]
-
-  def repo(self) -> str:
-    return self.source_repo.split('/')[1]
+  def source_repo(self) -> SourceRepo:
+    return self._source
 
   def match_tag(self, tag: str) -> str | None:
     """Returns version string if tag matches tag_pattern, else None."""
@@ -56,7 +56,7 @@ class HookConfig:
     return None
 
   def source_url(self) -> str:
-    return f"https://github.com/{self.source_repo}.git"
+    return source.REGISTRY.source_url(self._source)
 
 
 @dataclass
@@ -152,7 +152,7 @@ def load_config(path: str) -> ProxyConfig | None:
     if 'command' not in h:
       raise ValueError(f"Missing required field 'command' in {ctx}")
     hooks.append(HookConfig(
-      source_repo=require(h, 'source_repo', ctx),
+      source=require(h, 'source', ctx),
       tag_pattern=require(h, 'tag_pattern', ctx),
       command=_parse_command(h.get('command'), ctx),
       env=_parse_env(h.get('env'), ctx),
