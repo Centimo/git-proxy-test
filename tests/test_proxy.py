@@ -833,6 +833,53 @@ class TestProxyToForgejoChunkedReassembly:
     assert req.data == body
     assert req.headers.get("Content-length") == str(len(body))
 
+  def test_malformed_chunk_size_returns_400_no_upstream(self):
+    handler = _make_handler(
+      path="/github.com/owner/repo/git-upload-pack",
+      command="POST",
+      headers={"Transfer-Encoding": "chunked"},
+      rfile_bytes=b"zz\r\nhello\r\n0\r\n\r\n",  # "zz" is not a hex chunk size
+    )
+    handler.send_response = MagicMock()
+    handler.send_header = MagicMock()
+    handler.end_headers = MagicMock()
+    with patch("proxy.urllib.request.urlopen") as urlopen:
+      handler.proxy_to_forgejo(SRC, "/git-upload-pack")
+    handler.send_response.assert_called_once_with(400)
+    urlopen.assert_not_called()
+
+  def test_oversized_chunked_body_returns_400(self):
+    # A declared chunk larger than the cap must abort (before reading the data) with 400.
+    huge = format(proxy.REQUEST_BODY_MAX + 1, "x").encode()
+    handler = _make_handler(
+      path="/github.com/owner/repo/git-upload-pack",
+      command="POST",
+      headers={"Transfer-Encoding": "chunked"},
+      rfile_bytes=huge + b"\r\n",  # size line only; parsing aborts before reading the body
+    )
+    handler.send_response = MagicMock()
+    handler.send_header = MagicMock()
+    handler.end_headers = MagicMock()
+    with patch("proxy.urllib.request.urlopen") as urlopen:
+      handler.proxy_to_forgejo(SRC, "/git-upload-pack")
+    handler.send_response.assert_called_once_with(400)
+    urlopen.assert_not_called()
+
+  def test_non_integer_content_length_returns_400(self):
+    handler = _make_handler(
+      path="/github.com/owner/repo/git-upload-pack",
+      command="POST",
+      headers={"Content-Length": "not-a-number"},
+      rfile_bytes=b"",
+    )
+    handler.send_response = MagicMock()
+    handler.send_header = MagicMock()
+    handler.end_headers = MagicMock()
+    with patch("proxy.urllib.request.urlopen") as urlopen:
+      handler.proxy_to_forgejo(SRC, "/git-upload-pack")
+    handler.send_response.assert_called_once_with(400)
+    urlopen.assert_not_called()
+
   def test_forgejo_path_reconstructed_with_mirror_name_and_query(self):
     """proxy_to_forgejo must rebuild the path as /<user>/<mirror_name><service>?<query>,
     surviving a nested repo path and a query string (info/refs)."""

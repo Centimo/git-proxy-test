@@ -49,6 +49,7 @@ MIRROR_WAIT_TIMEOUT = 300  # how long to poll for mirror to become ready
 SYNC_FRESHNESS_TTL = int(os.environ.get("PROXY_SYNC_TTL", "30"))  # seconds a mirror is considered fresh after a successful sync
 SYNC_WAIT_TIMEOUT = 120  # how long to wait (mode=wait) for mirror-sync to complete, polling mirror_updated
 SYNC_CACHE_MAX = 1000  # cap on number of repos tracked in the freshness cache to prevent unbounded growth
+REQUEST_BODY_MAX = 512 * 1024 * 1024  # cap on a reassembled request body; upload-pack negotiation is small, pushes are 403'd earlier
 
 
 class _StructuredFormatter(logging.Formatter):
@@ -466,6 +467,34 @@ class ProxyHandler(BaseHTTPRequestHandler):
       self.end_headers()
       self.wfile.write(body)
 
+  def _read_chunked_body(self, max_bytes: int) -> bytes:
+    """Reassemble a Transfer-Encoding: chunked request body. Raises ValueError on a
+    malformed/oversized stream (invalid chunk size, EOF mid-body, total over max_bytes) so
+    the caller can return 400 rather than the handler thread dying on an int() parse."""
+    chunks = []
+    total = 0
+    while True:
+      size_line = self.rfile.readline()
+      if not size_line:
+        raise ValueError("unexpected EOF in chunked body")
+      # A chunk-size line may carry ';'-separated chunk extensions — ignore them.
+      size_token = size_line.split(b";", 1)[0].strip()
+      try:
+        chunk_size = int(size_token, 16)
+      except ValueError:
+        raise ValueError(f"invalid chunk size: {size_token!r}")
+      if chunk_size < 0:
+        raise ValueError(f"negative chunk size: {chunk_size}")
+      if chunk_size == 0:
+        self.rfile.read(2)  # trailing CRLF
+        break
+      total += chunk_size
+      if total > max_bytes:
+        raise ValueError(f"chunked body exceeds {max_bytes} bytes")
+      chunks.append(self.rfile.read(chunk_size))
+      self.rfile.read(2)  # CRLF after chunk
+    return b"".join(chunks)
+
   def proxy_to_forgejo(self, source_repo: SourceRepo, service: str):
     name = source_repo.mirror_name()
     # Reconstruct the Forgejo path from the parsed git service + original query string,
@@ -490,25 +519,27 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     content_length_str = self.headers.get("Content-Length")
     transfer_encoding = self.headers.get("Transfer-Encoding", "").lower()
-    if content_length_str is not None:
-      body = self.rfile.read(int(content_length_str))
-    elif "chunked" in transfer_encoding:
-      # Read chunked request body and reassemble
-      chunks = []
-      while True:
-        size_line = self.rfile.readline().strip()
-        chunk_size = int(size_line, 16)
-        if chunk_size == 0:
-          self.rfile.read(2)  # trailing CRLF
-          break
-        chunks.append(self.rfile.read(chunk_size))
-        self.rfile.read(2)  # CRLF after chunk
-      body = b"".join(chunks)
-      # Send reassembled body with Content-Length
-      forward_headers["Content-Length"] = str(len(body))
-      forward_headers.pop("Transfer-Encoding", None)
-    else:
-      body = None
+    try:
+      if content_length_str is not None:
+        length = int(content_length_str)
+        if length < 0 or length > REQUEST_BODY_MAX:
+          raise ValueError(f"Content-Length out of range: {length}")
+        body = self.rfile.read(length)
+      elif "chunked" in transfer_encoding:
+        body = self._read_chunked_body(REQUEST_BODY_MAX)
+        # Send reassembled body with Content-Length
+        forward_headers["Content-Length"] = str(len(body))
+        forward_headers.pop("Transfer-Encoding", None)
+      else:
+        body = None
+    except ValueError as e:
+      # Malformed framing from an untrusted client — 400 instead of letting the parse
+      # exception kill the handler thread.
+      log.warning("malformed request body", extra={"repo": source_repo.key(), "error": str(e)})
+      self.send_response(400)
+      self.send_header("Content-Length", "0")
+      self.end_headers()
+      return
 
     req = urllib.request.Request(
       forgejo_url,
