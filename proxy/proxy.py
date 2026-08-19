@@ -49,6 +49,7 @@ MIRROR_WAIT_TIMEOUT = 300  # how long to poll for mirror to become ready
 SYNC_FRESHNESS_TTL = int(os.environ.get("PROXY_SYNC_TTL", "30"))  # seconds a mirror is considered fresh after a successful sync
 SYNC_WAIT_TIMEOUT = 120  # how long to wait (mode=wait) for mirror-sync to complete, polling mirror_updated
 SYNC_CACHE_MAX = 1000  # cap on number of repos tracked in the freshness cache to prevent unbounded growth
+BROKEN_MIRROR_RETRY_INTERVAL = 1800  # min seconds between re-migrate attempts for the same broken mirror
 REQUEST_BODY_MAX = 512 * 1024 * 1024  # cap on a reassembled request body; upload-pack negotiation is small, pushes are 403'd earlier
 
 
@@ -187,6 +188,9 @@ class MirrorFreshness:
     # was fired off, so followers in "wait" mode can join it).
     self._ensure_inflight: dict[str, threading.Event] = {}
     self._ensure_lock = threading.Lock()
+    # Throttling for re-migrating mirrors left broken by an interrupted initial migration.
+    self._recreate_attempts: "OrderedDict[str, float]" = OrderedDict()
+    self._recreate_lock = threading.Lock()
 
   def _is_fresh(self, key: str) -> bool:
     with self._freshness_lock:
@@ -396,9 +400,43 @@ class MirrorFreshness:
         log.info("mirror-sync triggered", extra={"repo": key, "elapsed_ms": elapsed_ms, "result": "ok"})
       else:
         log.warning("mirror-sync api error", extra={"repo": key, "elapsed_ms": elapsed_ms, "status": status, "body": str(data)[:200], "result": "error"})
+        self._recreate_broken_mirror(source_repo, key)
     finally:
       with self._sync_lock:
         self._sync_triggered.discard(key)
+
+  def _recreate_broken_mirror(self, source_repo: SourceRepo, key: str):
+    """Recovers a mirror left unusable by an interrupted initial migration.
+
+    Such a repo exists in Forgejo but never got its mirror settings, so it stays empty
+    forever and every mirror-sync is rejected with "Repository is not a mirror" — syncing
+    can never fix it, only deleting the stale repo and migrating again.
+
+    Acts only on a repo Forgejo still reports as empty, so a populated mirror is never at
+    risk. Re-attempts are throttled: a repo whose migration keeps failing (too large for
+    the link, upstream gone) must not have its partial download deleted on every request."""
+    mirror = get_mirror(source_repo)
+    if mirror is None or not mirror.get("empty", True):
+      return
+
+    with self._recreate_lock:
+      now = time.monotonic()
+      last = self._recreate_attempts.get(key)
+      if last is not None and now - last < BROKEN_MIRROR_RETRY_INTERVAL:
+        log.info("broken mirror re-migrate skipped: cooldown", extra={"repo": key, "since_last_s": int(now - last)})
+        return
+      self._recreate_attempts[key] = now
+      self._recreate_attempts.move_to_end(key)
+      while len(self._recreate_attempts) > self._cache_max:
+        self._recreate_attempts.popitem(last=False)
+
+    name = source_repo.mirror_name()
+    status, data = forgejo_api("DELETE", f"/repos/{self._forgejo_user}/{name}")
+    if status not in (204, 404):
+      log.error("broken mirror delete failed", extra={"repo": key, "status": status, "body": str(data)[:200]})
+      return
+    log.warning("broken mirror deleted, re-running migrate", extra={"repo": key, "status": status})
+    _do_migrate(source_repo)
 
 
 def pkt_line(s: str) -> bytes:

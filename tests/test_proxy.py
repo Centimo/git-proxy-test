@@ -1019,3 +1019,130 @@ class TestHandleGitRequest:
     handler.send_response.assert_called_once_with(400)
     handler.end_headers.assert_called_once()
     handler.proxy_to_forgejo.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# MirrorFreshness — recovery from an interrupted initial migration
+# ---------------------------------------------------------------------------
+
+class TestBrokenMirrorRecreate:
+  """An initial migration that dies half-way leaves Forgejo with a repository row but no
+  mirror settings. Such a repo reports empty=True forever and mirror-sync answers
+  400 "Repository is not a mirror", so no amount of syncing can ever populate it —
+  only deleting the stale repo and re-running migrate recreates those settings."""
+
+  def _freshness(self):
+    return proxy.MirrorFreshness(
+      forgejo_url="http://forgejo.local",
+      forgejo_user="gitadmin",
+      forgejo_password="pw",
+    )
+
+  def _api(self, calls, sync_status=400, delete_status=204):
+    def fake_api(method, path, body=None, timeout=proxy.FORGEJO_API_TIMEOUT):
+      calls.append((method, path))
+      if path.endswith("/mirror-sync"):
+        return sync_status, {"message": "Repository is not a mirror"} if sync_status != 200 else {}
+      if method == "DELETE":
+        return delete_status, {}
+      return 200, {}
+    return fake_api
+
+  def test_sync_rejected_on_empty_mirror_deletes_repo_and_remigrates(self):
+    mf = self._freshness()
+    calls = []
+    with patch.object(proxy, "forgejo_api", side_effect=self._api(calls)), \
+         patch.object(proxy, "get_mirror", return_value={"empty": True}), \
+         patch.object(proxy, "_do_migrate") as mock_migrate:
+      mf._do_sync(SRC, SRC.key())
+
+    assert ("DELETE", f"/repos/gitadmin/{SRC.mirror_name()}") in calls
+    mock_migrate.assert_called_once_with(SRC)
+
+  def test_sync_rejected_on_populated_mirror_leaves_repo_alone(self):
+    """A populated mirror holds real data — a sync rejection there must never delete it."""
+    mf = self._freshness()
+    calls = []
+    with patch.object(proxy, "forgejo_api", side_effect=self._api(calls)), \
+         patch.object(proxy, "get_mirror", return_value={"empty": False}), \
+         patch.object(proxy, "_do_migrate") as mock_migrate:
+      mf._do_sync(SRC, SRC.key())
+
+    assert not any(method == "DELETE" for method, _ in calls)
+    mock_migrate.assert_not_called()
+
+  def test_sync_rejected_on_missing_repo_leaves_recreate_to_create_on_demand(self):
+    mf = self._freshness()
+    calls = []
+    with patch.object(proxy, "forgejo_api", side_effect=self._api(calls)), \
+         patch.object(proxy, "get_mirror", return_value=None), \
+         patch.object(proxy, "_do_migrate") as mock_migrate:
+      mf._do_sync(SRC, SRC.key())
+
+    assert not any(method == "DELETE" for method, _ in calls)
+    mock_migrate.assert_not_called()
+
+  def test_successful_sync_never_recreates(self):
+    mf = self._freshness()
+    calls = []
+    with patch.object(proxy, "forgejo_api", side_effect=self._api(calls, sync_status=200)), \
+         patch.object(proxy, "get_mirror", return_value={"empty": True}), \
+         patch.object(proxy, "_do_migrate") as mock_migrate:
+      mf._do_sync(SRC, SRC.key())
+
+    assert not any(method == "DELETE" for method, _ in calls)
+    mock_migrate.assert_not_called()
+
+  def test_delete_failure_does_not_run_migrate(self):
+    """Re-migrating without a successful delete would just hit the same stale repo."""
+    mf = self._freshness()
+    calls = []
+    with patch.object(proxy, "forgejo_api", side_effect=self._api(calls, delete_status=500)), \
+         patch.object(proxy, "get_mirror", return_value={"empty": True}), \
+         patch.object(proxy, "_do_migrate") as mock_migrate:
+      mf._do_sync(SRC, SRC.key())
+
+    assert ("DELETE", f"/repos/gitadmin/{SRC.mirror_name()}") in calls
+    mock_migrate.assert_not_called()
+
+  def test_recreate_not_retried_within_cooldown(self):
+    """A repo too large for the link fails migration repeatedly; retrying on every request
+    would delete the partial download each time and never converge."""
+    mf = self._freshness()
+    calls = []
+    with patch.object(proxy, "forgejo_api", side_effect=self._api(calls)), \
+         patch.object(proxy, "get_mirror", return_value={"empty": True}), \
+         patch.object(proxy, "_do_migrate") as mock_migrate:
+      mf._do_sync(SRC, SRC.key())
+      mf._do_sync(SRC, SRC.key())
+
+    assert sum(1 for method, _ in calls if method == "DELETE") == 1
+    assert mock_migrate.call_count == 1
+
+  def test_recreate_retried_after_cooldown_expires(self):
+    mf = self._freshness()
+    calls = []
+    with patch.object(proxy, "forgejo_api", side_effect=self._api(calls)), \
+         patch.object(proxy, "get_mirror", return_value={"empty": True}), \
+         patch.object(proxy, "_do_migrate") as mock_migrate:
+      mf._do_sync(SRC, SRC.key())
+      base = time.monotonic()
+      with patch.object(proxy.time, "monotonic", return_value=base + proxy.BROKEN_MIRROR_RETRY_INTERVAL + 1):
+        mf._do_sync(SRC, SRC.key())
+
+    assert sum(1 for method, _ in calls if method == "DELETE") == 2
+    assert mock_migrate.call_count == 2
+
+  def test_recreate_attempt_cache_is_bounded(self):
+    mf = proxy.MirrorFreshness(
+      forgejo_url="http://forgejo.local", forgejo_user="gitadmin", forgejo_password="pw",
+      cache_max=3,
+    )
+    with patch.object(proxy, "forgejo_api", side_effect=self._api([])), \
+         patch.object(proxy, "get_mirror", return_value={"empty": True}), \
+         patch.object(proxy, "_do_migrate"):
+      for i in range(10):
+        repo = SourceRepo("github.com", f"owner/repo{i}")
+        mf._do_sync(repo, repo.key())
+
+    assert len(mf._recreate_attempts) <= 3
