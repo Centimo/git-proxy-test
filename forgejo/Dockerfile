@@ -6,7 +6,7 @@ RUN apk add --no-cache curl bash python3 py3-yaml
 
 COPY forgejo/app.ini /etc/forgejo/app.ini
 COPY forgejo/entrypoint.sh /entrypoint.sh
-COPY proxy/proxy.py proxy/config.py proxy/hooks.py /app/
+COPY proxy/proxy.py proxy/config.py proxy/hooks.py proxy/source.py /app/
 RUN chmod +x /entrypoint.sh
 
 VOLUME ["/data"]
