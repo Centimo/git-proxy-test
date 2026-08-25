@@ -184,6 +184,22 @@ class TestParseOriginalUrl:
     assert reg.parse_original_url(None) is None
 
 
+class TestBaseUrl:
+  def test_default_and_override(self):
+    reg = SourceRegistry.from_env("github.com,gitlab.example.com=https://gitlab.example.com:8443")
+    assert reg.base_url("github.com") == "https://github.com"
+    assert reg.base_url("gitlab.example.com") == "https://gitlab.example.com:8443"
+
+  def test_host_is_lowercased(self):
+    reg = SourceRegistry.from_env("github.com")
+    assert reg.base_url("GitHub.com") == "https://github.com"
+
+  def test_unknown_host_raises(self):
+    reg = SourceRegistry.from_env("github.com")
+    with pytest.raises(KeyError):
+      reg.base_url("bitbucket.org")
+
+
 # ---------------------------------------------------------------------------
 # _is_upload_pack_request(service, command, query)
 # ---------------------------------------------------------------------------

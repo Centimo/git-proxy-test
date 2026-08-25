@@ -10,7 +10,10 @@ Forgejo API moves the on-disk repository too, so no data is refetched.
 The new name is derived from each repo's `original_url` — recorded by Forgejo at migration
 time and inverted by `SourceRegistry.parse_original_url()` — never guessed from the old name.
 
-Dry run by default; pass --apply to perform the renames.
+Dry run by default; pass --apply to perform the renames. A repo whose `original_url` cannot be
+mapped at all — a traversal segment or a name the proxy rejects — stops the run, since a partial
+rename would leave the cache half-migrated; --ignore-unresolved migrates the rest and leaves those
+entries under their old names.
 """
 
 import argparse
@@ -64,6 +67,25 @@ def list_repos(url: str, token: str, user: str) -> list[dict]:
     page += 1
 
 
+def unresolved_reason(url) -> str:
+  """Why parse_original_url rejected this original_url, in words. Mirrors its checks; used
+  only for the report, so the decision itself still comes from parse_original_url."""
+  if not isinstance(url, str) or not url:
+    return "no original_url recorded"
+  for host in source.REGISTRY.hosts():
+    prefix = source.REGISTRY.base_url(host) + "/"
+    if not url.startswith(prefix):
+      continue
+    path = url[len(prefix):].strip("/").removesuffix(".git")
+    if not path:
+      return "no repository path after the host"
+    for seg in path.split("/"):
+      if seg in (".", ".."):
+        return f"path segment {seg!r} — a traversal artifact; no such repository upstream"
+    return "a path segment is not a valid repository name"
+  return f"host outside PROXY_SOURCES ({', '.join(source.REGISTRY.hosts())})"
+
+
 def build_plan(repos: list[dict]) -> tuple[list[tuple[str, str]], list[str], list[str]]:
   """Returns (renames, already_current, unresolved): renames as (old_name, new_name)."""
   renames: list[tuple[str, str]] = []
@@ -73,7 +95,8 @@ def build_plan(repos: list[dict]) -> tuple[list[tuple[str, str]], list[str], lis
     name = repo["name"]
     src = source.REGISTRY.parse_original_url(repo.get("original_url"))
     if src is None:
-      unresolved.append(f"{name} (original_url={repo.get('original_url')!r})")
+      unresolved.append(f"{name}: {unresolved_reason(repo.get('original_url'))} "
+                        f"(original_url={repo.get('original_url')!r})")
       continue
     new_name = src.mirror_name()
     if new_name == name:
@@ -106,6 +129,8 @@ def validate(renames: list[tuple[str, str]], all_names: set[str]):
 def main():
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   parser.add_argument("--apply", action="store_true", help="perform the renames (default: dry run)")
+  parser.add_argument("--ignore-unresolved", action="store_true",
+                      help="migrate the mappable repos and leave the unmappable ones under their old names")
   parser.add_argument("--forgejo-url", default=os.environ.get("FORGEJO_URL", DEFAULT_FORGEJO_URL))
   parser.add_argument("--user", default=os.environ.get("FORGEJO_USER", DEFAULT_USER))
   parser.add_argument("--token-file", default=os.environ.get("FORGEJO_TOKEN_FILE", DEFAULT_TOKEN_FILE))
@@ -130,8 +155,12 @@ def main():
     print(f"\nunresolved ({len(unresolved)}):")
     for u in unresolved:
       print(f"  {u}")
-    sys.exit("FATAL: some repos could not be mapped to the current scheme; "
-             "renaming only part of them would leave the cache half-migrated")
+    if not args.ignore_unresolved:
+      sys.exit("FATAL: some repos could not be mapped to the current scheme; renaming only part of them\n"
+               "would leave the cache half-migrated. An entry rejected for a traversal segment or an\n"
+               "invalid name can never be reached through the proxy under any scheme — pass\n"
+               "--ignore-unresolved to migrate the rest and leave those under their old names.")
+    print("\n  --ignore-unresolved: kept under their old names, unreachable through the proxy")
 
   validate(renames, {r["name"] for r in repos})
 

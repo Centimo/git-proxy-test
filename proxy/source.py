@@ -93,6 +93,10 @@ class SourceRegistry:
   def _base(self, host: str) -> str:
     return self._hosts[host.lower()]
 
+  def base_url(self, host: str) -> str:
+    """Base URL registered for an allowlisted host (raises KeyError if not allowed)."""
+    return self._base(host)
+
   def clone_addr(self, source: SourceRepo) -> str:
     """Upstream clone URL for a source repo (`{base}/{path}.git`)."""
     return f"{self._base(source.host)}/{source.path}.git"
