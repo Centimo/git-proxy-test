@@ -19,5 +19,7 @@ services:
     # Without host mode, Forgejo cannot reach the upstream source hosts through the proxy.
     network_mode: host
     volumes:
-      - /workspace/cache/git-proxy:/data
-      - /workspace/cache/git-proxy/hooks-config:/config:ro
+      # Host directory holding the repositories, the sqlite database and the API token.
+      # It differs between machines, so the path is a variable rather than a constant.
+      - ${DATA_DIR:-/workspace/cache/git-proxy}:/data
+      - ${DATA_DIR:-/workspace/cache/git-proxy}/hooks-config:/config:ro

@@ -240,6 +240,7 @@ Docker-bridge. Без host-режима Forgejo не достучится до g
 
 | Переменная                | Назначение                                     |
 |---------------------------|------------------------------------------------|
+| `DATA_DIR`                | Каталог на хосте под репозитории, базу и токен (по умолчанию `/workspace/cache/git-proxy`); читается только `docker-compose.yml`, в контейнер не передаётся |
 | `FORGEJO_ADMIN_USER`      | Логин админа Forgejo (обязательно)             |
 | `FORGEJO_ADMIN_PASSWORD`  | Пароль админа (обязательно)                     |
 | `FORGEJO_ADMIN_EMAIL`     | Email админа (по умолчанию `admin@localhost`)  |
@@ -295,7 +296,8 @@ docker compose up -d --build
 - Forgejo:   `http://<host>:3000`
 - git-proxy: `http://<host>:8080`
 
-Данные (репозитории, sqlite, токен) — в `/workspace/cache/git-proxy` на хосте (см. volumes).
+Данные (репозитории, sqlite, токен) — в `${DATA_DIR}` на хосте, по умолчанию
+`/workspace/cache/git-proxy` (см. volumes).
 
 ## Тесты
 
