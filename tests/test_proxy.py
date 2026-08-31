@@ -1054,6 +1054,17 @@ class TestHandleGitRequest:
     handler.end_headers.assert_called_once()
     handler.proxy_to_forgejo.assert_not_called()
 
+  def test_rejection_is_self_delimiting_so_the_client_does_not_hang(self):
+    """A rejection with neither a body length nor a connection close leaves an HTTP/1.1
+    client waiting for a body that never ends — git hangs instead of reporting the error."""
+    handler = self._handler("/bitbucket.org/owner/repo/info/refs?service=git-upload-pack")
+    with patch.object(proxy, "get_mirror"):
+      handler.handle_git_request()
+    headers = {call.args[0]: call.args[1] for call in handler.send_header.call_args_list}
+    body = handler.wfile.getvalue()
+    assert body, "the client is told nothing about why the request was rejected"
+    assert headers.get("Content-Length") == str(len(body))
+
   def test_non_allowlisted_host_rejected_with_400_no_get_mirror(self):
     handler = self._handler("/bitbucket.org/owner/repo/info/refs?service=git-upload-pack")
     with patch.object(proxy, "get_mirror") as mock_get_mirror:

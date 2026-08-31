@@ -660,8 +660,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
     parsed = parse_request_path(path_only, source.REGISTRY)
     if parsed is None:
       log.warning("rejected invalid request path", extra={"path": self.path})
+      # A bodiless response under HTTP/1.1 has no length and does not close the connection,
+      # so the client waits for a body that never comes — the rejection has to be spelled
+      # out and measured. git prints a text/plain body as "remote: <message>". The path is
+      # not echoed back: it comes from the caller.
+      body = (b"git-proxy: expected /<host>/<repo-path>/<git-service>, "
+              b"with <host> listed in PROXY_SOURCES\n")
       self.send_response(400)
+      self.send_header("Content-Type", "text/plain")
+      self.send_header("Content-Length", str(len(body)))
       self.end_headers()
+      self.wfile.write(body)
       return
 
     source_repo, service = parsed
