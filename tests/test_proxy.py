@@ -1,6 +1,7 @@
 import io
 import threading
 import time
+import urllib.error
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -8,6 +9,10 @@ import pytest
 import proxy
 import source
 from source import SourceRepo, SourceRegistry, parse_request_path
+
+# Bound before the autouse fixture in conftest replaces the module attribute, so the tests
+# for the probe itself run the real implementation.
+REAL_UPSTREAM_EXISTS = proxy.upstream_exists
 from conftest import NoOpThread
 
 
@@ -948,12 +953,34 @@ class TestHandleGitRequest:
     handler = self._handler("/github.com/owner/repo/info/refs?service=git-upload-pack")
     handler.wait_for_mirror.return_value = None
     with patch.object(proxy, "get_mirror", return_value=None), \
+         patch.object(proxy, "upstream_exists", return_value=True), \
          patch.object(proxy, "create_mirror") as mock_create:
       handler.handle_git_request()
     mock_create.assert_called_once_with(SRC)
     handler.wait_for_mirror.assert_called_once_with(SRC)
     handler.send_git_error.assert_called_once()
     handler.proxy_to_forgejo.assert_not_called()
+
+  def test_missing_upstream_is_answered_404_and_nothing_is_created(self):
+    """A path nobody ever published — a scanner probe, a typo — must not leave an empty
+    repository behind in Forgejo."""
+    handler = self._handler("/github.com/owner/repo/info/refs?service=git-upload-pack")
+    with patch.object(proxy, "get_mirror", return_value=None), \
+         patch.object(proxy, "upstream_exists", return_value=False), \
+         patch.object(proxy, "create_mirror") as mock_create:
+      handler.handle_git_request()
+    mock_create.assert_not_called()
+    handler.send_response.assert_called_once_with(404)
+    handler.wait_for_mirror.assert_not_called()
+    handler.proxy_to_forgejo.assert_not_called()
+
+  def test_existing_mirror_is_not_probed_upstream(self):
+    """The check costs an upstream request, so it belongs only on the create path."""
+    handler = self._handler("/github.com/owner/repo/info/refs?service=git-upload-pack")
+    with patch.object(proxy, "get_mirror", return_value={"empty": False}), \
+         patch.object(proxy, "upstream_exists") as mock_probe:
+      handler.handle_git_request()
+    mock_probe.assert_not_called()
 
   def test_mirror_empty_triggers_sync_then_waits(self):
     handler = self._handler("/github.com/owner/repo/info/refs?service=git-upload-pack")
@@ -1109,6 +1136,20 @@ class TestBrokenMirrorRecreate:
     assert not any(method == "DELETE" for method, _ in calls)
     mock_migrate.assert_not_called()
 
+  def test_vanished_upstream_keeps_the_broken_mirror(self):
+    """Deleting a repo whose upstream is gone would only remove what is left of it, and the
+    migration that follows could not succeed anyway."""
+    mf = self._freshness()
+    calls = []
+    with patch.object(proxy, "forgejo_api", side_effect=self._api(calls)), \
+         patch.object(proxy, "get_mirror", return_value={"empty": True}), \
+         patch.object(proxy, "upstream_exists", return_value=False), \
+         patch.object(proxy, "_do_migrate") as mock_migrate:
+      mf._do_sync(SRC, SRC.key())
+
+    assert not any(method == "DELETE" for method, _ in calls)
+    mock_migrate.assert_not_called()
+
   def test_delete_failure_does_not_run_migrate(self):
     """Re-migrating without a successful delete would just hit the same stale repo."""
     mf = self._freshness()
@@ -1162,3 +1203,59 @@ class TestBrokenMirrorRecreate:
         mf._do_sync(repo, repo.key())
 
     assert len(mf._recreate_attempts) <= 3
+
+
+# ---------------------------------------------------------------------------
+# upstream_exists — the guard in front of mirror creation
+# ---------------------------------------------------------------------------
+
+class TestUpstreamExists:
+  def _resp(self, status):
+    resp = MagicMock()
+    resp.status = status
+    resp.__enter__ = MagicMock(return_value=resp)
+    resp.__exit__ = MagicMock(return_value=False)
+    return resp
+
+  def _http_error(self, code):
+    return urllib.error.HTTPError(url="u", code=code, msg="m", hdrs=None, fp=None)
+
+  def test_asks_the_ref_discovery_endpoint_of_the_clone_url(self):
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+      captured["url"] = req.full_url
+      return self._resp(200)
+
+    with patch("proxy.urllib.request.urlopen", side_effect=fake_urlopen):
+      assert REAL_UPSTREAM_EXISTS(SRC) is True
+    assert captured["url"] == "https://github.com/owner/repo.git/info/refs?service=git-upload-pack"
+
+  @pytest.mark.parametrize("code", [401, 403, 404])
+  def test_unreadable_upstream_is_reported_absent(self, code):
+    with patch("proxy.urllib.request.urlopen", side_effect=self._http_error(code)):
+      assert REAL_UPSTREAM_EXISTS(SRC) is False
+
+  def test_unexpected_status_does_not_block_the_migration(self):
+    with patch("proxy.urllib.request.urlopen", side_effect=self._http_error(500)):
+      assert REAL_UPSTREAM_EXISTS(SRC) is True
+
+  def test_transport_error_does_not_block_the_migration(self):
+    with patch("proxy.urllib.request.urlopen", side_effect=urllib.error.URLError("unreachable")):
+      assert REAL_UPSTREAM_EXISTS(SRC) is True
+
+  def test_base_url_override_is_honoured(self):
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+      captured["url"] = req.full_url
+      return self._resp(200)
+
+    reg = source.SourceRegistry.from_env("gitlab.example.com=https://gitlab.example.com:8443")
+    src = SourceRepo("gitlab.example.com", "group/sub/repo")
+    with patch.object(source, "REGISTRY", reg), \
+         patch("proxy.urllib.request.urlopen", side_effect=fake_urlopen):
+      assert REAL_UPSTREAM_EXISTS(src) is True
+    assert captured["url"] == (
+      "https://gitlab.example.com:8443/group/sub/repo.git/info/refs?service=git-upload-pack"
+    )

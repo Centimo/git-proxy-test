@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "proxy"))
 
 import pytest
 
+import proxy
 import source
 
 
@@ -17,6 +18,18 @@ def _source_registry():
   source.REGISTRY = source.SourceRegistry.from_env("github.com,gitlab.com")
   yield
   source.REGISTRY = saved
+
+
+@pytest.fixture(autouse=True)
+def _upstream_exists():
+  """Answer the upstream existence probe with "yes" everywhere. The probe sits in front of
+  every mirror creation and talks to the real host, which no test may do; a test that cares
+  about a missing upstream patches it itself. TestUpstreamExists exercises the real function
+  through the reference it captured at import time."""
+  saved = proxy.upstream_exists
+  proxy.upstream_exists = lambda source_repo: True
+  yield
+  proxy.upstream_exists = saved
 
 
 class NoOpThread:

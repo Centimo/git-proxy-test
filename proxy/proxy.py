@@ -50,6 +50,7 @@ SYNC_FRESHNESS_TTL = int(os.environ.get("PROXY_SYNC_TTL", "30"))  # seconds a mi
 SYNC_WAIT_TIMEOUT = 120  # how long to wait (mode=wait) for mirror-sync to complete, polling mirror_updated
 SYNC_CACHE_MAX = 1000  # cap on number of repos tracked in the freshness cache to prevent unbounded growth
 BROKEN_MIRROR_RETRY_INTERVAL = 1800  # min seconds between re-migrate attempts for the same broken mirror
+UPSTREAM_PROBE_TIMEOUT = 15  # seconds to wait for the upstream existence check
 REQUEST_BODY_MAX = 512 * 1024 * 1024  # cap on a reassembled request body; upload-pack negotiation is small, pushes are 403'd earlier
 
 
@@ -125,6 +126,40 @@ def get_mirror(source_repo: SourceRepo) -> dict | None:
   if status == 200:
     return data
   return None
+
+
+def upstream_exists(source_repo: SourceRepo) -> bool:
+  """Whether the upstream repository is there and readable without credentials.
+
+  Asks the git smart-HTTP ref-discovery endpoint — the very request a clone starts with.
+  Migrating a repository that is not there leaves an empty Forgejo repo behind for good, and
+  every request for a path someone made up would leave one more, so a definite "not readable"
+  answer (404, or 401/403 for a repository no anonymous clone could fetch anyway) means no
+  mirror is created.
+
+  Anything else — a transport error, an unexpected status — counts as "cannot tell" and lets
+  the migration proceed. This guard keeps out requests for repositories that do not exist; it
+  is not a reason to fail a legitimate first clone because the link hiccuped.
+  """
+  url = f"{source.REGISTRY.clone_addr(source_repo)}/info/refs?service=git-upload-pack"
+  key = source_repo.key()
+  req = urllib.request.Request(url, headers={"User-Agent": "git/2.0 (git-proxy)"})
+  try:
+    with urllib.request.urlopen(req, timeout=UPSTREAM_PROBE_TIMEOUT) as resp:
+      if resp.status == 200:
+        return True
+      log.warning("upstream probe: unexpected status", extra={"repo": key, "status": resp.status})
+      return True
+  except urllib.error.HTTPError as e:
+    if e.code in (401, 403, 404):
+      log.warning("upstream repository not available", extra={"repo": key, "status": e.code})
+      return False
+    log.warning("upstream probe: unexpected status", extra={"repo": key, "status": e.code})
+    return True
+  except Exception as e:
+    log.warning("upstream probe failed, assuming the repository exists",
+                extra={"repo": key, "error": str(e)})
+    return True
 
 
 def _do_migrate(source_repo: SourceRepo):
@@ -430,6 +465,11 @@ class MirrorFreshness:
       while len(self._recreate_attempts) > self._cache_max:
         self._recreate_attempts.popitem(last=False)
 
+    # Past the cooldown gate, so this costs one upstream request per retry interval at most.
+    if not upstream_exists(source_repo):
+      log.warning("broken mirror left alone: missing upstream", extra={"repo": key})
+      return
+
     name = source_repo.mirror_name()
     status, data = forgejo_api("DELETE", f"/repos/{self._forgejo_user}/{name}")
     if status not in (204, 404):
@@ -644,6 +684,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
     freshness: MirrorFreshness = self.server.freshness  # type: ignore[attr-defined]
 
     if mirror is None:
+      if not upstream_exists(source_repo):
+        log.warning("refused to mirror a repository missing upstream", extra={"repo": key})
+        body = b"repository not found upstream"
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return
       log.info("mirror create-on-demand", extra={"repo": key})
       create_mirror(source_repo)
     elif mirror.get("empty", True):
